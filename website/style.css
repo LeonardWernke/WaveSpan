@@ -256,3 +256,14 @@ dd a { display: inline-block; margin-top: .4rem; color: var(--accent); }
   .progress-gallery { grid-template-columns:minmax(0, 1fr); }
   .hero.wrap { padding-block:var(--space-3); }
 }
+
+.launcher-preview {
+  padding-bottom: 48px;
+}
+
+.launcher-preview img {
+  display: block;
+  width: min(100%, 1049px);
+  height: auto;
+  margin-inline: auto;
+}

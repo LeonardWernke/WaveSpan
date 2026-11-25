@@ -21,7 +21,7 @@ The build runs on your PC.
 > readable on disk. WaveSpan reads files as supplied and includes no decryption tools or keys. Keep game files,
 > generated shaders, extracted assets, and saves on your PC.
 
-![Python launcher showing package selection, build folders, and activity](docs/wavespan-launcher.png)
+![Windows launcher showing package selection, build folders, and activity](docs/wavespan-launcher.png)
 
 ## Tested games
 

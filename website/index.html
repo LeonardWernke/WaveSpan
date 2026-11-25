@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Follow WaveSpan, an experimental Windows runtime and shader translation toolkit for the Xbox Series build of GTA VI.">
   <meta name="theme-color" content="#080c17">
-  <title>WaveSpan - Xbox Series runtime research</title>
+  <title>WaveSpan — Xbox Series runtime research</title>
   <link rel="icon" href="../assets/wavespan-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="horizon.css">
@@ -42,14 +42,15 @@
     </section>
 
     <section class="section wrap" id="status" aria-labelledby="status-title">
-  <div class="progress-lead"><h2 id="status-title">Can I play it on my PC?</h2>
-  <p><strong>Gameplay is unavailable.</strong> Synthetic graphics tests render through Vulkan. The next milestone is booting the retail executable and rendering its first frame.</p></div>
+  <div class="progress-lead"><h2 id="status-title">Where WaveSpan stands</h2>
+  <p><strong>The Windows runtime launches the retail executable, and the local decompiler works.</strong> Retail startup reached D3D12 descriptor heap initialization. The next milestone is the first rendered retail frame.</p></div>
   <div class="progress-gallery">
   <section class="screen-panel">
-  <h3 class="evidence-title">Rendering milestones</h3>
+  <h3 class="evidence-title">Launch and rendering milestones</h3>
   <dl class="screen-check">
-    <div><dt>Synthetic Vulkan frames</dt><dd>Works</dd></div>
-    <div><dt>First retail frame</dt><dd>Next goal</dd></div>
+    <div><dt>Windows runtime (gta6rt.exe)</dt><dd>Launches retail executable</dd></div>
+    <div><dt>Synthetic Vulkan frames</dt><dd>Verified</dd></div>
+    <div><dt>First retail frame</dt><dd>Awaiting verification</dd></div>
     <div><dt>Gameplay</dt><dd>Unavailable</dd></div>
   </dl>
   </section>
@@ -69,7 +70,7 @@
   <h3 class="evidence-title">What else works?</h3>
   <dl class="status-list">
     <div><dt>Windows runtime</dt><dd><p>Stand-in tests cover loader startup, thread-local storage, file I/O, and threads. Xbox platform API coverage is partial.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/testing.md">See the Windows tests</a></dd></div>
-    <div><dt>Package checks and asset export</dt><dd><p>WaveSpan checks the supported package and exports models, textures, and audio with partial format coverage.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/README.md#archives-and-assets">See asset documentation</a></dd></div>
+    <div><dt>Local decompiler and asset exporter</dt><dd><p>The build checks the supported package, disassembles precompiled Xbox Series shaders, translates supported shaders to Vulkan SPIR-V, and exports models, textures, and audio. Asset format coverage is partial.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/README.md#archives-and-assets">See asset documentation</a></dd></div>
   </dl>
 </section>
 

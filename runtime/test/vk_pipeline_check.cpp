@@ -1003,7 +1003,8 @@ int main(int argc, char** argv) {
         }
     };
 
-    const bool use_validation_cache = !no_cache && stats_path.empty();
+    // --cache-feedback measures VkPipelineCache hits, so like --stats it must still invoke vkCreate*Pipelines.
+    const bool use_validation_cache = !no_cache && stats_path.empty() && !cache_feedback;
     const std::string val_cache_path = cache_path.empty() ? (dir + "/.vk_pipeline_check_cache") : (cache_path + ".validated");
     std::unordered_set<std::string> validated_keys;
     if (use_validation_cache) {

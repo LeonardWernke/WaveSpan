@@ -273,7 +273,7 @@ jobs:
           test -s "$dir/cache.bin"
 
           cp "$dir/stubs/ps_empty.spv" "$dir/missing.spv"
-          check
+          check --no-cache
           grep -Fx 'ps pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
           grep -Fx 'vs pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
           if grep -F 'cache feedback' "$dir/check.log"; then exit 1; fi  # opt-in: nothing without the flag

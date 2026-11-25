@@ -31,6 +31,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - name: Stage website files
         run: |
           mkdir -p _site/assets

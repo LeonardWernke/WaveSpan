@@ -158,11 +158,11 @@ class SplitArgsTests(unittest.TestCase):
     def test_commas_inside_parentheses_stay_together(self):
         self.assertEqual(
             shader_ir.split_args("a, b(1, 2), c"),
-            ["a", " b(1, 2)", " c"],
+            ["a", "b(1, 2)", "c"],
         )
 
     def test_commas_inside_brackets_stay_together(self):
-        self.assertEqual(shader_ir.split_args("[v1, v2], v3"), ["[v1, v2]", " v3"])
+        self.assertEqual(shader_ir.split_args("[v1, v2], v3"), ["[v1, v2]", "v3"])
 
     def test_trailing_comma_is_dropped(self):
         self.assertEqual(shader_ir.split_args("v0,"), ["v0"])

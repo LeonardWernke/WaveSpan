@@ -236,6 +236,10 @@ class WaveMachine(cpu_ref.Machine):
         parts = base.split("_")
         if len(parts) == 3 and parts[0] == "s" and parts[1] in _SOP2_LOGIC and parts[2] in ("b32", "b64"):
             self._expect(ins, 3)
+            if base == "s_and_b32" and self.wave == 32 and any(
+                src["k"] == "special" and src["t"] == "exec_hi" for src in a[1:]
+            ):
+                raise Unsupported(op, self.pc, "exec_hi source in a wave32 program is not modelled")
             mask_op = self._touches_mask(a)
             if parts[2] == "b64" or mask_op:
                 if parts[2] == "b64" or any(x["k"] == "special" and x["t"] in ("exec", "vcc") for x in a):
@@ -260,6 +264,8 @@ class WaveMachine(cpu_ref.Machine):
             return None
         if base == "s_mov_b32" and self._touches_mask(a):
             self._expect(ins, 2)
+            if self.wave == 64 and a[0]["k"] == "special" and a[0]["t"] == "exec_hi":
+                raise Unsupported(op, self.pc, "exec_hi destination in a wave64 program is not modelled")
             v = a[1]["v"] & MASK32 if a[1]["k"] == "imm" else self._read_mask(a[1]) & MASK32
             self._write_mask(a[0], v)
             return None

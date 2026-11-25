@@ -1,0 +1,44 @@
+name: WaveSpan website
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "assets/wavespan-hero.png"
+      - "assets/wavespan-mark.png"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@v5
+      - name: Stage website files
+        run: |
+          mkdir -p _site/assets
+          cp website/{index.html,style.css,horizon.css,horizon.js,react-bits-LICENSE.txt} _site/
+          cp assets/{wavespan-hero.png,wavespan-mark.png} _site/assets/
+          sed -i 's|\.\./assets/|assets/|g' _site/index.html _site/style.css
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
+        id: deployment

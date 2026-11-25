@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="WaveSpan is an experimental Xbox Series runtime and shader translation toolkit for Windows.">
+  <meta name="description" content="Follow WaveSpan, an experimental Windows runtime and shader translation toolkit for the Xbox Series build of GTA VI.">
   <meta name="theme-color" content="#080c17">
-  <title>WaveSpan — Xbox Series runtime research</title>
+  <title>WaveSpan - Xbox Series runtime research</title>
   <link rel="icon" href="../assets/wavespan-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="horizon.css">
@@ -29,11 +29,11 @@
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div id="wavespan-horizon" aria-hidden="true"></div>
-      
+
       <div class="hero-copy">
         <p class="eyebrow"><span class="dot"></span> In development</p>
         <h1 id="hero-title">Xbox Series.<br><span>On Windows.</span></h1>
-        <p class="intro">WaveSpan is an experiment in running an Xbox Series game on a Windows PC using your own game files.</p>
+        <p class="intro">WaveSpan is an experimental Windows runtime and shader translation toolkit for the Xbox Series build of GTA VI.</p>
         <div class="actions">
           <a class="button primary" href="#status">Explore progress</a>
           <a class="button secondary" href="https://github.com/LeonardWernke/WaveSpan">View source</a>
@@ -43,40 +43,40 @@
 
     <section class="section wrap" id="status" aria-labelledby="status-title">
   <div class="progress-lead"><h2 id="status-title">Can I play it on my PC?</h2>
-  <p><strong>Not yet.</strong> WaveSpan can draw a picture when a small test program tells it what to draw. The next goal is getting the Xbox game itself to start and draw its first picture.</p></div>
+  <p><strong>Gameplay is unavailable.</strong> Synthetic graphics tests render through Vulkan. The next milestone is booting the retail executable and rendering its first frame.</p></div>
   <div class="progress-gallery">
   <section class="screen-panel">
-  <h3 class="evidence-title">What can you see on screen?</h3>
+  <h3 class="evidence-title">Rendering milestones</h3>
   <dl class="screen-check">
-    <div><dt>A picture from a test program</dt><dd>Works</dd></div>
-    <div><dt>The first picture from the Xbox game</dt><dd>Next goal</dd></div>
-    <div><dt>A game you can control</dt><dd>Not playable yet</dd></div>
+    <div><dt>Synthetic Vulkan frames</dt><dd>Works</dd></div>
+    <div><dt>First retail frame</dt><dd>Next goal</dd></div>
+    <div><dt>Gameplay</dt><dd>Unavailable</dd></div>
   </dl>
   </section>
   <figure class="shader-count">
     <h3>Graphics translation</h3>
-    <p>The game uses small programs called shaders to tell the graphics chip how to draw things. WaveSpan translates them for the PC. Three recorded tests checked the same 26,503 shaders.</p>
-    <figcaption>Programs still to pass the format check</figcaption>
+    <p>WaveSpan translates RDNA2 shaders to Vulkan SPIR-V. Three recorded runs tracked progress across 26,503 primary shaders.</p>
+    <figcaption>Shaders still to pass validation</figcaption>
     <ol>
       <li><span>Earlier test</span><meter min="0" max="1500" value="1471" aria-label="Earlier test: 1,471 shaders short of passing"></meter><strong>1,471</strong></li>
       <li><span>Later test</span><meter min="0" max="1500" value="2" aria-label="Later test: 2 shaders short of passing"></meter><strong>2</strong></li>
       <li><span>Latest shown</span><meter min="0" max="1500" value="0" aria-label="Latest test shown: all shaders passed"></meter><strong>0</strong></li>
     </ol>
-    <p><strong>All 26,503 passed in the last test shown.</strong> The translated instructions follow the required format. Checking whether they draw the right picture takes a separate test.</p>
+    <p><strong>All 26,503 passed SPIR-V validation in the recorded run.</strong> Separate GPU tests check whether translated shaders produce the expected results.</p>
     <a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/shader_validation.md">See the recorded tests</a>
   </figure>
   </div>
   <h3 class="evidence-title">What else works?</h3>
   <dl class="status-list">
-    <div><dt>Running small programs</dt><dd><p>Test programs can start on Windows, read files, and run tasks side by side.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/testing.md">See the Windows tests</a></dd></div>
-    <div><dt>Opening game files</dt><dd><p>WaveSpan can extract some 3D models, images, and sounds from the game files.</p></dd></div>
+    <div><dt>Windows runtime</dt><dd><p>Stand-in tests cover loader startup, thread-local storage, file I/O, and threads. Xbox platform API coverage is partial.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/testing.md">See the Windows tests</a></dd></div>
+    <div><dt>Package checks and asset export</dt><dd><p>WaveSpan checks the supported package and exports models, textures, and audio with partial format coverage.</p><a href="https://github.com/LeonardWernke/WaveSpan/blob/main/docs/README.md#archives-and-assets">See asset documentation</a></dd></div>
   </dl>
 </section>
 
     <section class="section start wrap" aria-labelledby="start-title">
       <div>
         <h2 id="start-title">Build locally</h2>
-        <p>Use your own readable copy of the supported Xbox Series package, version 1.0.2.1. The build runs on your PC.</p>
+        <p>On Windows 10 or 11 x64, open <code>Build.bat</code> to check your own readable copy of GTA VI for Xbox Series, version 1.0.2.1, and build a local workspace. It opens the Windows launcher when installed and falls back to the Python launcher.</p>
       </div>
       <a class="button primary" href="https://github.com/LeonardWernke/WaveSpan#how-to-build">Read the build guide</a>
     </section>

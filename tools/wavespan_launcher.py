@@ -607,4 +607,8 @@ def run_windows_builder():
 
 
 if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     run_windows_builder()

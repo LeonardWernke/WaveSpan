@@ -152,6 +152,7 @@ const elements = {};
 function makeElement(id) {
   const listeners = {};
   const classes = new Set();
+  const attributes = new Map();
   const el = {
     id,
     value: "",
@@ -168,6 +169,13 @@ function makeElement(id) {
     get childElementCount() { return this.children.length; },
     get firstElementChild() { return this.children[0] || null; },
     appendChild(child) { this.children.push(child); },
+    querySelectorAll(selector) {
+      assert.strictEqual(selector, "[data-stage]");
+      return this.children.filter((child) => child.dataset.stage);
+    },
+    setAttribute(name, value) { attributes.set(name, value); },
+    getAttribute(name) { return attributes.get(name); },
+    removeAttribute(name) { attributes.delete(name); },
     classList: {
       toggle(name, force) {
         if (force === undefined) {
@@ -205,6 +213,10 @@ const sandbox = {
   },
 };
 
+const checkStage = makeElement("checkStage");
+checkStage.dataset.stage = "check";
+checkStage.textContent = "Package";
+makeElement("buildGraph").appendChild(checkStage);
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
 const normalize = (obj) => JSON.parse(JSON.stringify(obj));
 assert.deepStrictEqual(normalize(posted.shift()), { type: "ready" });
@@ -237,7 +249,15 @@ for (const fn of webviewListeners.message) {
 assert.strictEqual(elements.statusLabel.textContent, "Building workspace\u2026");
 assert.strictEqual(elements.heroStatus.textContent, "Building workspace\u2026");
 assert.strictEqual(elements.stopBtn.disabled, false);
-assert.strictEqual(elements.progressTrack.classList.contains("hidden"), false);
+assert.strictEqual(elements.progressTrack.classList.contains("hidden"), true);
+assert.strictEqual(elements.buildGraph.hidden, false);
+assert.strictEqual(checkStage.dataset.state, "waiting");
+
+for (const fn of webviewListeners.message) {
+  fn({ data: { type: "buildProgress", progress: { stage: "check", detail: "Checking package" } } });
+}
+assert.strictEqual(checkStage.getAttribute("aria-current"), "step");
+assert.strictEqual(elements.graphPhase.textContent, "Checking package");
 
 for (const fn of webviewListeners.message) {
   fn({ data: { type: "buildFinished", returnCode: 0, checkOnly: false, stopped: false } });
@@ -247,6 +267,8 @@ assert.strictEqual(elements.heroStatus.textContent, "Build complete");
 assert.strictEqual(elements.heroBanner.dataset.tone, "success");
 assert.strictEqual(elements.stopBtn.disabled, true);
 assert.strictEqual(elements.progressTrack.classList.contains("hidden"), true);
+assert.strictEqual(checkStage.dataset.state, "complete");
+assert.strictEqual(checkStage.getAttribute("aria-current"), undefined);
 """
         proc = subprocess.run([node, "-e", harness, app_js_path], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)

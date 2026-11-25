@@ -138,6 +138,8 @@ struct VulkanDeviceInfo {
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
+    // The queue family supports VK_QUEUE_SPARSE_BINDING_BIT and features.sparseBinding is enabled.
+    bool sparse_binding = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // WAVESPAN_SHADERS environment variable.
     std::string shader_dir;
@@ -292,5 +294,12 @@ inline wavespan::ResourceId resource_id(const ID3D12Resource* resource) {
 inline wavespan::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
     return reinterpret_cast<wavespan::QueryHeapId>(heap);
 }
+
+// Sparse tile mapping on a command queue (vkQueueBindSparse when sparseBinding is enabled; no-op otherwise).
+void update_tile_mappings(wavespan::VulkanContext& context, VkQueue vk_queue, ID3D12Resource* resource,
+                          UINT num_regions, const D3D12_TILED_RESOURCE_COORDINATE* region_starts,
+                          const D3D12_TILE_REGION_SIZE* region_sizes, ID3D12Heap* heap, UINT num_ranges,
+                          const D3D12_TILE_RANGE_FLAGS* range_flags, const UINT* heap_range_offsets,
+                          const UINT* range_tile_counts, D3D12_TILE_MAPPING_FLAGS flags);
 
 }  // namespace rt::d3d12

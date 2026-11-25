@@ -48,6 +48,7 @@ from mc_command import mc_command  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
+_launcher_progress = False
 WINDOWS_ONLY = ("runtime",)   # off Windows: the clang-cl + xwin cross-build, or --runtime-build
 CROSS_TOOLS = ("clang-cl", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt")
 CROSS_VARS = {"C_COMPILER": "clang-cl", "CXX_COMPILER": "clang-cl", "LINKER": "lld-link", "AR": "llvm-lib",
@@ -65,6 +66,13 @@ MODEL_ARCHIVES = [
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
+
+
+def report_progress(stage: str, detail: str | None = None,
+                    done: int | None = None, total: int | None = None) -> None:
+    """Send a build checkpoint to the desktop launcher. A null detail marks a completed stage."""
+    if _launcher_progress:
+        print("@wavespan-progress " + json.dumps(dict(stage=stage, detail=detail, done=done, total=total)), flush=True)
 
 
 def fail(msg: str) -> "None":
@@ -380,24 +388,33 @@ def icloud_default_notes() -> list:
 
 
 # ---------------------------------------------------------------- preflight
-MIN_FREE_GB = {"shaders": 30, "assets": 300}
+# Keep the fresh-export estimate, including headroom, split by the outputs each step produces.
+ARCHIVE_EXPORT_GB = 150
+TEXTURE_POOL_EXPORT_GB = 90
+AUDIO_EXPORT_GB = 60
+MIN_FREE_GB = {"shaders": 30, "assets": ARCHIVE_EXPORT_GB + TEXTURE_POOL_EXPORT_GB + AUDIO_EXPORT_GB}
 
 
-def assets_exported(work: str) -> bool:
-    """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
-    last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
-    too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
-    xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
-    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again."""
+def archive_exported(out: str, rel: str, mode: str) -> bool:
+    name = os.path.splitext(os.path.basename(rel))[0]
+    return os.path.isfile(os.path.join(out, name, mode, "manifest.json"))
+
+
+def step_finished(path: str, what: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip() == f"{what} finished"
+    except (OSError, UnicodeError):
+        return False
+
+
+def audio_exported(work: str) -> bool:
+    """Check audio resume markers before crediting the audio export's disk space."""
     audio = os.path.join(work, "assets", "audio")
-    for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
-        try:
-            with open(os.path.join(audio, name), encoding="utf-8") as f:
-                if f.read().strip() != f"{what} finished":
-                    return False
-        except (OSError, UnicodeError):
-            return False
-    return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
+    return (os.path.isfile(os.path.join(audio, "audio_manifest.json"))
+            and step_finished(os.path.join(audio, "ogg.done"), "awc_opus.py")
+            and step_finished(os.path.join(audio, "xma.done"), "rpf9dump xma")
+            and not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma"))))
 
 
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
@@ -413,7 +430,7 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
-              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
+              fallbacks: tuple[str, ...] = (), jobs: int = 1, game: str | None = None) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
@@ -437,7 +454,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
     if "assets" in stages:
         if not dotnet_sdk_ok():
-            missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
+            missing.append(".NET SDK 8 or newer on PATH (rpf9dump targets .NET 8): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
     if os.name == "nt" and "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
@@ -458,13 +475,21 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
-    # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
-    # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
-    if need.get("assets") and not wav and assets_exported(work):
-        log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
-        need["assets"] = 0
+    fresh_gb = sum(need.values())
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
+    if need.get("assets") and not wav:
+        assets_out = os.path.join(work, "assets")
+        if all(archive_exported(assets_out, rel, mode) for rel in MODEL_ARCHIVES for mode in ("models", "textures")):
+            log(f"preflight: reusing model and archive texture exports; no need to reserve {ARCHIVE_EXPORT_GB} GB")
+            need["assets"] -= ARCHIVE_EXPORT_GB
+        if audio_exported(work):
+            log(f"preflight: reusing audio exports; no need to reserve {AUDIO_EXPORT_GB} GB")
+            need["assets"] -= AUDIO_EXPORT_GB
+        # Scanning every DDS is worthwhile when reusing the pools could let the build fit.
+        if free_gb < sum(need.values()) and game is not None and texture_pools_exported(game, work):
+            log(f"preflight: reusing texture pool exports; no need to reserve {TEXTURE_POOL_EXPORT_GB} GB")
+            need["assets"] -= TEXTURE_POOL_EXPORT_GB
     need_gb = sum(need.values())
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
@@ -472,6 +497,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+    if need_gb < fresh_gb:
+        log(f"preflight: {free_gb:.0f} GB free, about {need_gb} GB needed for remaining work")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
@@ -621,6 +648,7 @@ def check(game: str, full: bool) -> dict:
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     if full:
+        report_progress("check", "Verifying SHA-256 hashes")
         py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     exe = os.path.join(game, v["expected_exe"])
     try:
@@ -717,12 +745,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     signature = llvm_mc_signature()
     t_shaders = time.monotonic()
     if not os.path.isfile(carved):
+        report_progress("shaders", "Carving shaders")
         log("shaders: carving shaders.rpf")
         drop(translated, shard_plan, disassembled, unpacked)
         t_step = time.monotonic()
         py("shader_carve.py", src, dxbc)
         log(f"  carve: {time.monotonic() - t_step:.1f}s")
     if not os.path.isfile(unpacked):
+        report_progress("shaders", "Unpacking native shader code")
         log("shaders: unpacking native code")
         drop(translated, shard_plan, disassembled)
         t_step = time.monotonic()
@@ -732,6 +762,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
     if not disassembly_matches(dxbc, signature):
+        report_progress("shaders", "Disassembling shaders")
         if os.path.isfile(disassembled) or os.path.isfile(translated):
             log("shaders: llvm-mc changed or the saved disassembly could not be verified")
         log("shaders: disassembling (gfx1013)")
@@ -995,13 +1026,15 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
     todo = [i for i in range(shard_count) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
-    if len(todo) < shard_count:
-        log(f"  keeping {shard_count - len(todo)} of {shard_count} shards finished by the run before")
+    finished = shard_count - len(todo)
+    if finished:
+        log(f"  keeping {finished} of {shard_count} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
     extra.extend(fallbacks)
     t_translate = time.monotonic()
     if todo:
+        report_progress("shaders", "Translating shader batches", finished, shard_count)
         which = f"0..{shard_count - 1}" if len(todo) == shard_count else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{shard_count} (workers={jobs})"
             + "".join(" " + e for e in extra))
@@ -1024,11 +1057,15 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                 r = p.wait()
                 if r != 0:
                     bad.append(f"shard {shard_idx} exited with {r}")
+                else:
+                    finished += 1
+                    report_progress("shaders", "Translating shader batches", finished, shard_count)
                 if queue:
                     launch(queue.pop(0))
                 continue
             still_active = []
             finished_any = False
+            previous = finished
             for shard_idx, p in active:
                 r = p.poll()
                 if r is None:
@@ -1037,6 +1074,10 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                     finished_any = True
                     if r != 0:
                         bad.append(f"shard {shard_idx} exited with {r}")
+                    else:
+                        finished += 1
+            if finished != previous:
+                report_progress("shaders", "Translating shader batches", finished, shard_count)
             active = still_active
             while queue and len(active) < jobs:
                 launch(queue.pop(0))
@@ -1047,6 +1088,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
             fail("rdna2spirv.py: " + ", ".join(bad))
     translate_sec = time.monotonic() - t_translate
     log(f"  translation: {translate_sec:.1f}s ({len(todo)}/{shard_count} shards)")
+    report_progress("shaders", "Merging shader batches")
     t_merge = time.monotonic()
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
     merge_sec = time.monotonic() - t_merge
@@ -1059,7 +1101,7 @@ def rpf9dump(work: str) -> str:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if not os.path.isdir(core):
         fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
-    need("dotnet", "Install the .NET 8 SDK.")
+    need("dotnet", "Install .NET SDK 8 or newer and make dotnet available on PATH.")
     log("assets: building rpf9dump")
     run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
          "-o", os.path.dirname(exe), "--nologo", "-v", "q"])
@@ -1096,28 +1138,12 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
-def assets(game: str, work: str, wav: bool, jobs: int) -> None:
-    # make_game.py also runs under python -I, which omits the script directory.
-    if TOOLS not in sys.path:
-        sys.path.insert(0, TOOLS)
-    import ttpf_assets
-
-    get_exporter = functools.cache(rpf9dump)
-    out = os.path.join(work, "assets")
-    for rel in MODEL_ARCHIVES:
-        src = os.path.join(game, rel)
-        name = os.path.splitext(os.path.basename(rel))[0]
-        for mode in ("models", "textures"):
-            if os.path.isfile(os.path.join(out, name, mode, "manifest.json")):
-                continue
-            log(f"assets: {mode} from {rel}")
-            run([get_exporter(work), mode, src, out])
+def texture_pools(game: str, out: str) -> list[tuple[str, str, str, str]]:
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
-    settings = ttpf_assets.load_profile(work) if pools else None
     # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
     # in one destination namespace would share that folder and its manifest, so the second pool would
     # look already exported and lose all its DDS. Give every member of a colliding group its own
@@ -1132,11 +1158,48 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     for _, name, dest, _ in info:
         key = (os.path.normcase(dest), os.path.normcase(name))
         counts[key] = counts.get(key, 0) + 1
-    for p, name, dest, rel in sorted(info, key=lambda x: os.path.getsize(x[0])):
+    exports = []
+    for p, name, dest, rel in info:
         root = dest
         if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
             root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
-        pool_dir = os.path.join(root, name)
+        exports.append((p, name, root, os.path.join(root, name)))
+    return exports
+
+
+def texture_pools_exported(game: str, work: str) -> bool:
+    import ttpf_assets
+
+    pools = texture_pools(game, os.path.join(work, "assets"))
+    if not pools:
+        return True
+    settings = ttpf_assets.load_profile(work)
+    for _, _, _, directory in pools:
+        manifest = ttpf_manifest(directory)
+        if manifest is None or ttpf_assets.pending_rows(manifest, settings):
+            return False
+    return True
+
+
+def assets(game: str, work: str, wav: bool, jobs: int) -> None:
+    import ttpf_assets
+
+    get_exporter = functools.cache(rpf9dump)
+    out = os.path.join(work, "assets")
+    report_progress("assets", "Checking and exporting archives", 0, len(MODEL_ARCHIVES))
+    for done, rel in enumerate(MODEL_ARCHIVES, 1):
+        src = os.path.join(game, rel)
+        for mode in ("models", "textures"):
+            if archive_exported(out, rel, mode):
+                continue
+            log(f"assets: {mode} from {rel}")
+            run([get_exporter(work), mode, src, out])
+        report_progress("assets", "Checking and exporting archives", done, len(MODEL_ARCHIVES))
+    pools = texture_pools(game, out)
+    if pools:
+        report_progress("assets", "Checking and exporting texture pools", 0, len(pools))
+        settings = ttpf_assets.load_profile(work)
+    for done, (p, name, root, pool_dir) in enumerate(sorted(pools, key=lambda pool: os.path.getsize(pool[0])), 1):
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
             log(f"assets: texture pool {os.path.relpath(p, game)}")
@@ -1147,7 +1210,10 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
+        report_progress("assets", "Checking and exporting texture pools", done, len(pools))
+    report_progress("assets", "Preparing audio")
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
+        report_progress("assets", "Exporting audio banks")
         log("assets: audio banks")
         run([get_exporter(work), "audio", os.path.join(game, "audio.rpf"), out])
     # The two audio steps below count as finished only by a marker written after they succeed: their folders are
@@ -1156,6 +1222,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     ogg_done = os.path.join(out, "audio", "ogg.done")
     if not os.path.isfile(ogg_done):
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
+        report_progress("assets", "Repackaging Ogg Opus audio")
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
         mark(ogg_done, "awc_opus.py")
@@ -1163,17 +1230,20 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         if not os.path.isdir(ogg):
             fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
         # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
+        report_progress("assets", "Decoding Opus audio to WAV")
         log("assets: audio Ogg Opus -> PCM WAV")
         py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
     if not os.path.isfile(xma_done):
+        report_progress("assets", "Exporting XMA2 audio")
         log("assets: XMA2 streams")
         run([get_exporter(work), "xma", os.path.join(game, "audio.rpf"), out])
         mark(xma_done, "rpf9dump xma")
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
     ff = shutil.which("ffmpeg")
     if ff:
+        report_progress("assets", "Decoding XMA2 audio")
         decode_xma(ff, xma_dir, jobs)
     else:
         log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
@@ -1359,6 +1429,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
 
 
 def main() -> int:
+    global _launcher_progress
     ap = argparse.ArgumentParser(description="WaveSpan checks your Xbox Series package and builds the Windows runtime.")
     ap.add_argument("--launcher", action="store_true", help="open the WaveSpan desktop launcher")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
@@ -1367,6 +1438,7 @@ def main() -> int:
                                   "Documents iCloud syncs)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
+    ap.add_argument("--launcher-progress", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
@@ -1397,7 +1469,17 @@ def main() -> int:
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
     a = ap.parse_args()
+    _launcher_progress = a.launcher_progress
     if a.launcher:
+        if os.name == "nt":
+            launcher_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "WaveSpanLauncher", "bin")
+            for exe in (
+                os.path.join(launcher_dir, "Release", "net10.0-windows", "win-x64", "publish", "WaveSpanLauncher.exe"),
+                os.path.join(launcher_dir, "Release", "net10.0-windows", "win-x64", "WaveSpanLauncher.exe"),
+            ):
+                if os.path.isfile(exe):
+                    subprocess.Popen([exe], env={**os.environ, "WAVESPAN_PYTHON": sys.executable})
+                    return 0
         try:
             from wavespan_launcher import open_launcher, tk
         except ImportError as error:
@@ -1425,8 +1507,10 @@ def main() -> int:
         print(f"{len(found)} found")
         return 0
     game = os.path.abspath(a.game or (pick_game() if a.pick else choose_game()))
+    report_progress("check", "Checking package files")
     v = check(game, a.full_check)
     if a.check:
+        report_progress("check")
         return 0
     out = os.path.abspath(a.out or default_out())
     work = os.path.abspath(a.work or os.path.join(out, "work"))
@@ -1473,21 +1557,30 @@ def main() -> int:
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
+    report_progress("check", "Checking build requirements")
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
+              fallbacks=fallbacks, jobs=a.jobs, game=game)
+    report_progress("check")
     if not a.out and icloud_documents():
         for note in icloud_default_notes():
             log(note)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
+        report_progress("shaders", "Checking shader cache")
         shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+        report_progress("shaders")
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
+        report_progress("assets")
     if "runtime" in stages:
+        report_progress("runtime", "Building the Windows runtime")
         runtime(game, out, v, runtime_build, a.jobs)
+        report_progress("runtime")
     if "pipelines" in stages:
+        report_progress("pipelines", "Validating pipelines on this GPU")
         pipelines(work, out, a.jobs)
+        report_progress("pipelines")
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

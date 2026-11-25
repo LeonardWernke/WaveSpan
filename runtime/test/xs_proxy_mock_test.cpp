@@ -70,9 +70,9 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator };
+enum class Kind { device, queue, fence, resource, allocator, list, heap };
 
-constexpr unsigned kMockSlots = 128;
+constexpr unsigned kMockSlots = 256;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
@@ -83,13 +83,14 @@ struct Mock {
     Kind kind;
     long refs;
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
+    int list_level;          // list: highest ID3D12GraphicsCommandListN it answers (0/4/6/8); device: lists it makes
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
     bool allocator_tag;      // allocator: answers kWaveSpanCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
     unsigned calls[kMockSlots];
-    std::uint64_t args[kMockSlots][5];
+    std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
 };
 
@@ -121,12 +122,25 @@ bool mock_has(const Mock* m, REFIID iid) {
             if (IsEqualIID(iid, levels[i])) return true;
         return false;
     }
-    if (IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12Pageable))) return true;
+    if (IsEqualIID(iid, __uuidof(ID3D12DeviceChild))) return true;
+    if (m->kind == Kind::list) {
+        if (IsEqualIID(iid, __uuidof(ID3D12CommandList)) || IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)))
+            return true;
+        const IID list_levels[] = {__uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList2),
+                                   __uuidof(ID3D12GraphicsCommandList3), __uuidof(ID3D12GraphicsCommandList4),
+                                   __uuidof(ID3D12GraphicsCommandList5), __uuidof(ID3D12GraphicsCommandList6),
+                                   __uuidof(ID3D12GraphicsCommandList7), __uuidof(ID3D12GraphicsCommandList8)};
+        for (int i = 0; i < m->list_level && i < static_cast<int>(std::size(list_levels)); ++i)
+            if (IsEqualIID(iid, list_levels[i])) return true;
+        return false;
+    }
+    if (IsEqualIID(iid, __uuidof(ID3D12Pageable))) return true;
     switch (m->kind) {
         case Kind::queue: return IsEqualIID(iid, __uuidof(ID3D12CommandQueue)) || IsEqualIID(iid, kExtraIid);
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
+        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kWaveSpanCommandAllocatorTag));
@@ -153,6 +167,7 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
     child->allocator_tag = device->allocator_tag;
+    child->list_level = device->list_level;
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
@@ -169,6 +184,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 12: return static_cast<std::uint32_t>(mock_create(m, Kind::list, words[4], words[5]));  // CreateCmdList
+            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));    // CreateDescriptorHeap
+            case 51: return static_cast<std::uint32_t>(mock_create(m, Kind::list, a4, words[4]));  // CreateCmdList1
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -188,7 +206,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
 
 template <unsigned Slot>
 std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
-                               std::uint64_t a5) {
+                               std::uint64_t a5, std::uint64_t a6) {
     if constexpr (Slot == 0) {
         return static_cast<std::uint32_t>(mock_query(self, reinterpret_cast<const IID*>(a1),
                                                      reinterpret_cast<void**>(a2)));
@@ -202,8 +220,10 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
         // forwarding them as stack arguments let MSVC tail-call mock_call and write into the caller's saved
         // registers (an optimized build corrupted the test's own locals that way).
         ++self->calls[Slot];
-        const std::uint64_t words[] = {a1, a2, a3, a4, a5};
+        const std::uint64_t words[] = {a1, a2, a3, a4, a5, a6};
         std::memcpy(self->args[Slot], words, sizeof(words));
+        if (self->kind == Kind::queue && Slot == 10) copy_array(self, Slot, a2, a1);
+        if (self->kind == Kind::list && Slot == 28) copy_array(self, Slot, a2, a1);
         return mock_call(self, Slot, words);
     }
 }
@@ -230,9 +250,9 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, 0, 0, 0, 0, 0, 0,
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
                                                   0, 0, 0);
 }
 
@@ -648,6 +668,149 @@ int check_allocators() {
     return 0;
 }
 
+// ---- 6a. Command lists (device slots 12 and 51) ----
+
+int check_command_lists() {
+    EXPECT(xs::device_slot_overridden(12) && xs::device_slot_overridden(51));
+    const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
+    const IID list4_iid = __uuidof(ID3D12GraphicsCommandList4);
+    const IID list6_iid = __uuidof(ID3D12GraphicsCommandList6);
+    const IID list8_iid = __uuidof(ID3D12GraphicsCommandList8);
+    const IID pageable_iid = __uuidof(ID3D12Pageable);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+
+    // Command-list interface levels 0/4/6/8 -> 60/77/80/82 public slots, tail refused up to 256.
+    struct ListLevel { int level; unsigned slots; } const list_levels[] = {{0, 60}, {4, 77}, {6, 80}, {8, 82}};
+    for (const ListLevel& ll : list_levels) {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 9, true, true);
+        EXPECT(device);
+        mock->list_level = ll.level;
+        const unsigned long device_refs = xs::device_proxy_ref_count(device);
+
+        void* allocator = nullptr;
+        EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+        Mock* const alloc_real = mock->last_child;
+        EXPECT(xs::is_allocator_proxy(allocator));
+
+        void* list = nullptr;
+        EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&list_iid),
+                         word(&list))) == S_OK);
+        Mock* const list_real = mock->last_child;
+        EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(list_real));
+        EXPECT(xs::list_proxy_slot_count(list) == ll.slots && xs::list_proxy_table_size() == 256);
+        EXPECT(mock->args[12][2] == word(alloc_real));  // CreateCommandList unwrapped the allocator proxy
+        EXPECT(xs::command_object_proxy_ref_count(list) == 1 && list_real->refs == 1);
+        EXPECT(xs::device_proxy_ref_count(device) == device_refs + 2);  // allocator + list
+
+        // Command lists are not ID3D12Pageable; QueryInterface answers up to ll.level only.
+        void* qi_out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(list, 0, word(&pageable_iid), word(&qi_out))) == E_NOINTERFACE && !qi_out);
+        for (const auto& check : std::initializer_list<std::pair<int, const IID*>>{
+                 {4, &list4_iid}, {6, &list6_iid}, {8, &list8_iid}}) {
+            qi_out = reinterpret_cast<void*>(1);
+            const HRESULT qhr = hr_of(raw(list, 0, word(check.second), word(&qi_out)));
+            if (ll.level >= check.first) {
+                EXPECT(qhr == S_OK && qi_out == list && release(qi_out) == 1);
+            } else {
+                EXPECT(qhr == E_NOINTERFACE && !qi_out);
+            }
+        }
+
+        // Public slots forward (Reset unwraps allocator); tail slots return E_NOTIMPL without reaching list_real.
+        EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK && list_real->calls[10] == 1 &&
+               list_real->args[10][0] == word(alloc_real));
+        EXPECT(hr_of(raw(list, ll.slots - 1)) == S_OK && list_real->calls[ll.slots - 1] == 1);
+        for (unsigned slot = ll.slots; slot < xs::list_proxy_table_size(); ++slot)
+            EXPECT(hr_of(raw(list, slot)) == E_NOTIMPL && list_real->calls[slot] == 0);
+
+        EXPECT(release(list) == 0 && list_real->refs == 0);
+        EXPECT(release(allocator) == 0 && alloc_real->refs == 0);
+        EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+
+    // SetDescriptorHeaps (list slot 28), ExecuteCommandLists (queue slot 10), CreateCommandList1 (device slot 51),
+    // and failure/allocation-failure paths.
+    {
+        Mock* mock = nullptr;
+        void* device3 = make_device(mock, 3, true, true);  // ID3D12Device3 (51 slots): CreateCommandList1 refused
+        void* out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device3, 51, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, word(&list_iid), word(&out))) ==
+               E_NOTIMPL && !out && mock->calls[51] == 0);
+        EXPECT(release(device3) == 0 && mock->refs == 0);
+
+        void* device = make_device(mock, 9, true, true);
+        mock->list_level = 8;
+        const unsigned long device_refs = xs::device_proxy_ref_count(device);
+        void* queue = make_queue(device);
+        Mock* const queue_real = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+        void* list = nullptr;
+        EXPECT(hr_of(raw(device, 51, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, word(&list_iid), word(&list))) == S_OK);
+        Mock* const list_real = mock->last_child;
+        EXPECT(xs::is_list_proxy(list) && mock->calls[51] == 1);
+
+        D3D12_DESCRIPTOR_HEAP_DESC hdesc{};
+        void* heap = nullptr;
+        EXPECT(hr_of(raw(device, 14, word(&hdesc), word(&heap_iid), word(&heap))) == S_OK);
+        EXPECT(xs::is_heap_proxy(heap));
+        const std::uint64_t real_heap = word(xs::heap_proxy_real_heap(heap));
+        const std::uint64_t heaps[2] = {word(heap), real_heap};
+        raw(list, 28, 2, word(heaps));
+        EXPECT(list_real->calls[28] == 1 && list_real->array[28][0] == real_heap &&
+               list_real->array[28][1] == real_heap);
+
+        const std::uint64_t lists[2] = {word(list), word(list_real)};
+        raw(queue, 10, 2, word(lists));
+        EXPECT(queue_real->calls[10] == 1 && queue_real->array[10][0] == word(list_real) &&
+               queue_real->array[10][1] == word(list_real));
+
+        // Long arrays (> 16) with allocation failure: must not reach the real object.
+        constexpr unsigned kLong = 32;
+        std::uint64_t many_heaps[kLong], many_lists[kLong];
+        for (unsigned i = 0; i < kLong; ++i) {
+            many_heaps[i] = word(heap);
+            many_lists[i] = word(list);
+        }
+        g_fail_news = 1;
+        raw(list, 28, kLong, word(many_heaps));
+        EXPECT(g_fail_news == 0 && list_real->calls[28] == 1);
+        g_fail_news = 1;
+        raw(queue, 10, kLong, word(many_lists));
+        EXPECT(g_fail_news == 0 && queue_real->calls[10] == 1);
+        // Without allocation failure, the long arrays are unwrapped and forwarded.
+        raw(list, 28, kLong, word(many_heaps));
+        raw(queue, 10, kLong, word(many_lists));
+        EXPECT(list_real->calls[28] == 2 && list_real->array[28][0] == real_heap);
+        EXPECT(queue_real->calls[10] == 2 && queue_real->array[10][0] == word(list_real));
+
+        // Creation failures on slots 12 and 51.
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 12, 0, 0, 0, 0, 0, word(&out))) == E_POINTER && !out);
+        EXPECT(hr_of(raw(device, 12, 0, 0, 0, 0, word(&list_iid), 0)) == S_FALSE);
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 51, 0, 0, 0, 0, word(&out))) == E_POINTER && !out);
+        EXPECT(hr_of(raw(device, 51, 0, 0, 0, word(&list_iid), 0)) == S_FALSE);
+        g_fail_news = 1;
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 12, 0, 0, 0, 0, word(&list_iid), word(&out))) == E_OUTOFMEMORY && !out);
+        EXPECT(g_fail_news == 0 && mock->last_child->refs == 0);
+        g_fail_news = 1;
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 51, 0, 0, 0, word(&list_iid), word(&out))) == E_OUTOFMEMORY && !out);
+        EXPECT(g_fail_news == 0 && mock->last_child->refs == 0);
+
+        EXPECT(release(heap) == 0 && release(list) == 0 && release(queue) == 0);
+        EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+
+    std::printf("%s: command lists (4/6/8) wrapped on slots 12/51, allocator/heaps/ExecuteCommandLists unwrapped, "
+                "tail refused, references balanced\n", g_label);
+    return 0;
+}
+
 // ---- 7. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -771,7 +934,7 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators())
+        check_alloc_failures() || check_allocators() || check_command_lists())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

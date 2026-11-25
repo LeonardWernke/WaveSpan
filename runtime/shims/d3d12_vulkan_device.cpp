@@ -1439,11 +1439,14 @@ public:
              D3D12_HEAP_FLAGS heap_flags)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
 
-    // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
-    // here and nothing goes back to the arena when this object dies.
+    // A placed resource lives inside a heap's arena range: retain a COM reference to the heap so the range stays
+    // reserved until every placed resource on it is destroyed.
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
-             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
+             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va, ID3D12Heap* placed_heap = nullptr)
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va),
+          placed_heap_(placed_heap) {
+        if (placed_heap_) placed_heap_->AddRef();
+    }
 
     ~Resource() override {
         if (accel_) {
@@ -1457,6 +1460,7 @@ public:
         if (image_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::device_memory, memory_);
+        if (placed_heap_) placed_heap_->Release();
     }
 
     wavespan::ResourceId id() const { return resource_id(this); }
@@ -1729,6 +1733,117 @@ public:
         desc_.Layout = layout;
     }
     bool reserved() const { return reserved_; }
+    bool sparse() const { return sparse_; }
+    const VkMemoryRequirements& sparse_memory_requirements() const { return sparse_requirements_; }
+    const VkSparseImageMemoryRequirements& sparse_image_requirements() const { return sparse_image_reqs_; }
+
+    HRESULT create_sparse_buffer() {
+        auto& vk = device_.context->vk;
+        if (!desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
+        const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
+        const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+        if (device_.info.features.sparseResidencyAliased) info.flags |= VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+        info.size = desc_.Width;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (addressable || need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_NOTIMPL;
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &sparse_requirements_);
+        if (addressable && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            address.buffer = buffer_;
+            va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+        }
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        wavespan::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.va = va_;
+        binding.not_zeroed = true;
+        device_.context->add_resource(id(), binding);
+        sparse_ = true;
+        reserved_ = true;
+        return S_OK;
+    }
+
+    HRESULT create_sparse_texture(const Format& format) {
+        auto& vk = device_.context->vk;
+        if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc_.SampleDesc.Count != 1) return E_NOTIMPL;
+        if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, 1);
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        VkImageCreateInfo& info = create.info;
+        info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+        if (device_.info.features.sparseResidencyAliased) info.flags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        if (FAILED(device_.check_image_support(info))) return E_NOTIMPL;
+        const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+        if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY) return E_OUTOFMEMORY;
+        if (created != VK_SUCCESS) return E_NOTIMPL;
+        vk.vkGetImageMemoryRequirements(device_.info.device, image_, &sparse_requirements_);
+        std::uint32_t sparse_count = 0;
+        vk.vkGetImageSparseMemoryRequirements(device_.info.device, image_, &sparse_count, nullptr);
+        std::vector<VkSparseImageMemoryRequirements> sparse_reqs(sparse_count);
+        if (sparse_count) vk.vkGetImageSparseMemoryRequirements(device_.info.device, image_, &sparse_count, sparse_reqs.data());
+        bool found_reqs = false;
+        for (const auto& req : sparse_reqs) {
+            if (req.formatProperties.aspectMask & format.aspects) {
+                sparse_image_reqs_ = req;
+                found_reqs = true;
+                break;
+            }
+        }
+        if (!found_reqs && !sparse_reqs.empty()) {
+            sparse_image_reqs_ = sparse_reqs[0];
+            found_reqs = true;
+        }
+        if (!found_reqs || !sparse_image_reqs_.formatProperties.imageGranularity.width ||
+            !sparse_image_reqs_.formatProperties.imageGranularity.height) {
+            vk.vkDestroyImage(device_.info.device, image_, nullptr);
+            image_ = VK_NULL_HANDLE;
+            return E_NOTIMPL;
+        }
+        wavespan::ResourceBinding binding{};
+        binding.image = image_;
+        binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.rgb96 = format.rgb96;
+        binding.depth24_as_float = format.d24_as_float;
+        binding.depth24 = format.d24;
+        binding.format = format.format;
+        binding.aspects = format.aspects;
+        binding.width = std::uint32_t(desc_.Width);
+        binding.height = desc_.Height;
+        binding.mip_levels = desc_.MipLevels;
+        binding.array_layers = info.arrayLayers;
+        binding.depth = 1;
+        binding.volume = false;
+        binding.samples = info.samples;
+        binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+        binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
+        binding.not_zeroed = true;  // sparse resources are backed by heap tiles or unmapped (zero), never pre-cleared
+        binding.sampled_in_general = device_.bindless != nullptr;
+        format_ = format.format;
+        r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
+        aspects_ = format.aspects;
+        rgb96_ = format.rgb96;
+        image_address_ = device_.next_image_address.fetch_add(256);
+        device_.register_image(image_address_,
+                               {image_, format_, aspects_, false, r9g9b9e5_as_r32_uint_,
+                                (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0});
+        binding_ = binding;
+        device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
+        sparse_ = true;
+        reserved_ = true;
+        return S_OK;
+    }
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
@@ -2022,11 +2137,15 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool reserved_ = false;
+    bool sparse_ = false;
+    VkMemoryRequirements sparse_requirements_{};
+    VkSparseImageMemoryRequirements sparse_image_reqs_{};
     wavespan::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    ID3D12Heap* placed_heap_ = nullptr;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -2185,6 +2304,7 @@ public:
     }
 
     ~Heap() override {
+        if (sparse_memory_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::device_memory, sparse_memory_);
         if (reserved_) device_.arena_release(offset_, desc_.SizeInBytes);
     }
 
@@ -2197,11 +2317,34 @@ public:
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
     D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
 
+    // Backing VkDeviceMemory for sparse tile binding (vkQueueBindSparse), allocated lazily on first tile map.
+    VkDeviceMemory sparse_memory(std::uint32_t memory_type_bits) {
+        std::lock_guard lock(sparse_mutex_);
+        if (sparse_memory_ != VK_NULL_HANDLE)
+            return (memory_type_bits & (1u << sparse_memory_type_)) ? sparse_memory_ : VK_NULL_HANDLE;
+        for (const std::uint32_t type_index : wavespan::memory_type_order(
+                 device_.memory, memory_type_bits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, desc_.SizeInBytes)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocate.allocationSize = desc_.SizeInBytes;
+            allocate.memoryTypeIndex = type_index;
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            if (device_.context->vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &mem) == VK_SUCCESS) {
+                sparse_memory_ = mem;
+                sparse_memory_type_ = type_index;
+                return sparse_memory_;
+            }
+        }
+        return VK_NULL_HANDLE;
+    }
+
 private:
     DeviceState& device_;
     D3D12_HEAP_DESC desc_;
     VkDeviceSize offset_ = 0;
     bool reserved_ = false;
+    std::mutex sparse_mutex_;
+    VkDeviceMemory sparse_memory_ = VK_NULL_HANDLE;
+    std::uint32_t sparse_memory_type_ = UINT32_MAX;
 };
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
@@ -4852,7 +4995,7 @@ public:
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
-        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va, heap);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -5852,6 +5995,36 @@ private:
             backing.MipLevels = desc->MipLevels;
         }
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.info.sparse_binding &&
+            state_.info.features.sparseResidencyBuffer && state_.context->vk.vkQueueBindSparse) {
+            auto* resource = new Resource(state_, *desc, heap, D3D12_HEAP_FLAG_NONE);
+            resource->attach_device(identity());
+            if (SUCCEEDED(resource->create_sparse_buffer())) {
+                if (!out) {
+                    resource->Release();
+                    return S_FALSE;
+                }
+                return hand_out(resource, riid, out);
+            }
+            resource->Release();
+        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->SampleDesc.Count == 1 &&
+                   state_.info.sparse_binding && state_.info.features.sparseResidencyImage2D &&
+                   state_.context->vk.vkQueueBindSparse && state_.context->vk.vkGetImageSparseMemoryRequirements) {
+            const Format format = texture_format(state_, backing);
+            if (format.format != VK_FORMAT_UNDEFINED) {
+                auto* resource = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
+                resource->attach_device(identity());
+                if (SUCCEEDED(resource->create_sparse_texture(format))) {
+                    resource->make_reserved(desc->Layout);
+                    if (!out) {
+                        resource->Release();
+                        return S_FALSE;
+                    }
+                    return hand_out(resource, riid, out);
+                }
+                resource->Release();
+            }
+        }
         ID3D12Resource* resource = nullptr;
         HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
                                              nullptr, IID_PPV_ARGS(&resource));
@@ -5866,6 +6039,7 @@ private:
         return hr;
     }
 
+public:
     // The tiling of a reserved resource's description; false for formats without a tile shape (three- and
     // twelve-byte texels, two-plane depth-stencil).
     static bool resource_tiling(const D3D12_RESOURCE_DESC& desc, wavespan::ResourceTiling& out) {
@@ -5892,6 +6066,7 @@ private:
         return wavespan::resource_tiling(tiling, out);
     }
 
+private:
     // Host image copies are used only on images in GENERAL (D3D12's COMMON), so GENERAL must be a layout the
     // device copies from and to on the host. Vulkan requires it to be; check rather than assume.
     void load_host_image_copy(PFN_vkGetDeviceProcAddr get_device) {
@@ -6365,6 +6540,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.debug_utils = has_debug_utils;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
+    bool chosen_sparse_queue = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
     bool chosen_draw_params = false;
@@ -6393,6 +6569,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.queue_family = i;
                 chosen = props;
                 chosen_bc = bc;
+                chosen_sparse_queue = (families[i].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
                 chosen_features = features.features;
                 chosen12 = f12;
                 chosen_draw_params = draw_params;
@@ -6610,6 +6787,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderInt16 = chosen_features.shaderInt16;
     enable.shaderClipDistance = chosen_features.shaderClipDistance;
     enable.shaderCullDistance = chosen_features.shaderCullDistance;
+    if (chosen_sparse_queue && chosen_features.sparseBinding) {
+        enable.sparseBinding = VK_TRUE;
+        enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
+        enable.sparseResidencyImage2D = chosen_features.sparseResidencyImage2D;
+        enable.sparseResidencyAliased = chosen_features.sparseResidencyAliased;
+        info.sparse_binding = true;
+    }
     info.features = enable;
 
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
@@ -6734,6 +6918,210 @@ bool has_global_realtime_privilege() {
 
 void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
+}
+
+void update_tile_mappings(wavespan::VulkanContext& context, VkQueue vk_queue, ID3D12Resource* resource,
+                          UINT num_regions, const D3D12_TILED_RESOURCE_COORDINATE* region_starts,
+                          const D3D12_TILE_REGION_SIZE* region_sizes, ID3D12Heap* heap, UINT num_ranges,
+                          const D3D12_TILE_RANGE_FLAGS* range_flags, const UINT* heap_range_offsets,
+                          const UINT* range_tile_counts, D3D12_TILE_MAPPING_FLAGS) {
+    Resource* r = Resource::from<Resource>(resource);
+    if (!r || !r->reserved() || !num_regions) return;
+    if (!r->sparse()) {
+        log_once("UpdateTileMappings ignored on non-sparse reserved resource; dimension", int(r->GetDesc().Dimension));
+        return;
+    }
+    auto& vk = context.vk;
+    if (!vk.vkQueueBindSparse) return;
+
+    const D3D12_RESOURCE_DESC desc = r->GetDesc();
+    wavespan::ResourceTiling tiling;
+    if (!Device::resource_tiling(desc, tiling)) return;
+
+    Heap* h = heap ? Heap::from<Heap>(heap) : nullptr;
+    VkDeviceMemory heap_mem = VK_NULL_HANDLE;
+    const auto need_heap_memory = [&] {
+        if (!num_ranges) return h != nullptr;
+        for (UINT j = 0; j < num_ranges; ++j) {
+            const D3D12_TILE_RANGE_FLAGS f = range_flags ? range_flags[j] : D3D12_TILE_RANGE_FLAG_NONE;
+            if (f != D3D12_TILE_RANGE_FLAG_NULL && f != D3D12_TILE_RANGE_FLAG_SKIP) return true;
+        }
+        return false;
+    };
+    if (need_heap_memory()) {
+        if (!h) {
+            log_once("UpdateTileMappings: non-null range without a valid heap", 1);
+            return;
+        }
+        heap_mem = h->sparse_memory(r->sparse_memory_requirements().memoryTypeBits);
+        if (!heap_mem) {
+            log_once("UpdateTileMappings: failed to allocate sparse backing memory for heap", 1);
+            return;
+        }
+    }
+
+    std::vector<VkSparseMemoryBind> buffer_binds;
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<VkSparseImageOpaqueMemoryBindInfo> opaque_infos;
+    std::vector<VkSparseMemoryBind> opaque_binds;
+
+    const bool is_buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    const VkMemoryRequirements mem_reqs = r->sparse_memory_requirements();
+    const VkSparseImageMemoryRequirements img_reqs = r->sparse_image_requirements();
+    const UINT mips = std::max<UINT>(1, desc.MipLevels);
+
+    UINT range_idx = 0;
+    UINT range_offset = 0;
+    const auto next_range_tile = [&](bool& skip, VkDeviceMemory& out_mem, VkDeviceSize& out_off) -> bool {
+        if (!num_ranges) {
+            skip = false;
+            if (!h) {
+                out_mem = VK_NULL_HANDLE;
+                out_off = 0;
+                return true;
+            }
+            const VkDeviceSize off = VkDeviceSize(range_offset++) * wavespan::tile_size_in_bytes;
+            if (off + wavespan::tile_size_in_bytes > h->bytes()) return false;
+            out_mem = heap_mem;
+            out_off = off;
+            return true;
+        }
+        while (range_idx < num_ranges) {
+            const UINT count = range_tile_counts ? range_tile_counts[range_idx] : UINT_MAX;
+            if (range_offset < count) break;
+            ++range_idx;
+            range_offset = 0;
+        }
+        if (range_idx >= num_ranges) return false;
+        const D3D12_TILE_RANGE_FLAGS f = range_flags ? range_flags[range_idx] : D3D12_TILE_RANGE_FLAG_NONE;
+        const UINT heap_start = heap_range_offsets ? heap_range_offsets[range_idx] : 0;
+        const UINT current_off = range_offset++;
+        if (f & D3D12_TILE_RANGE_FLAG_SKIP) {
+            skip = true;
+            return true;
+        }
+        skip = false;
+        if (f & D3D12_TILE_RANGE_FLAG_NULL) {
+            out_mem = VK_NULL_HANDLE;
+            out_off = 0;
+            return true;
+        }
+        if (!h) return false;
+        const UINT heap_tile = (f & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) ? heap_start : heap_start + current_off;
+        const VkDeviceSize off = VkDeviceSize(heap_tile) * wavespan::tile_size_in_bytes;
+        if (off + wavespan::tile_size_in_bytes > h->bytes()) return false;
+        out_mem = heap_mem;
+        out_off = off;
+        return true;
+    };
+
+    for (UINT ri = 0; ri < num_regions; ++ri) {
+        const D3D12_TILED_RESOURCE_COORDINATE coord =
+            region_starts ? region_starts[ri] : D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0};
+        const D3D12_TILE_REGION_SIZE size =
+            region_sizes ? region_sizes[ri] : D3D12_TILE_REGION_SIZE{tiling.total_tiles, FALSE, 0, 0, 0};
+        const UINT region_tiles = size.UseBox ? (size.Width * size.Height * std::max<UINT>(1, size.Depth))
+                                              : size.NumTiles;
+        for (UINT ti = 0; ti < region_tiles; ++ti) {
+            bool skip = false;
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            VkDeviceSize mem_off = 0;
+            if (!next_range_tile(skip, mem, mem_off)) break;
+            if (skip) continue;
+
+            if (is_buffer) {
+                const VkDeviceSize res_off = VkDeviceSize(coord.X + ti) * wavespan::tile_size_in_bytes;
+                if (res_off >= mem_reqs.size) continue;
+                VkSparseMemoryBind bind{};
+                bind.resourceOffset = res_off;
+                bind.size = std::min<VkDeviceSize>(wavespan::tile_size_in_bytes, mem_reqs.size - res_off);
+                bind.memory = mem;
+                bind.memoryOffset = mem_off;
+                buffer_binds.push_back(bind);
+                continue;
+            }
+
+            const UINT sub = coord.Subresource;
+            if (sub >= tiling.subresources.size()) continue;
+            const UINT mip = sub % mips;
+            const UINT layer = sub / mips;
+            if (mip < img_reqs.imageMipTailFirstLod) {
+                UINT tx = coord.X, ty = coord.Y;
+                if (size.UseBox) {
+                    const UINT wh = size.Width * size.Height;
+                    const UINT rem = wh ? (ti % wh) : 0;
+                    tx += size.Width ? (rem % size.Width) : 0;
+                    ty += size.Width ? (rem / size.Width) : 0;
+                } else {
+                    const UINT sub_w = std::max<UINT>(1, tiling.subresources[sub].width);
+                    const UINT linear = coord.Y * sub_w + coord.X + ti;
+                    tx = linear % sub_w;
+                    ty = linear / sub_w;
+                }
+                const UINT mip_w = std::max<UINT>(1, UINT(desc.Width) >> mip);
+                const UINT mip_h = std::max<UINT>(1, desc.Height >> mip);
+                const VkExtent3D gran = img_reqs.formatProperties.imageGranularity;
+                const UINT ox = tx * gran.width;
+                const UINT oy = ty * gran.height;
+                if (ox >= mip_w || oy >= mip_h) continue;
+                VkSparseImageMemoryBind bind{};
+                bind.subresource = {r->aspects(), mip, layer};
+                bind.offset = {std::int32_t(ox), std::int32_t(oy), 0};
+                bind.extent = {std::min(gran.width, mip_w - ox), std::min(gran.height, mip_h - oy), 1};
+                bind.memory = mem;
+                bind.memoryOffset = mem_off;
+                image_binds.push_back(bind);
+            } else {
+                const bool single_miptail =
+                    (img_reqs.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT) != 0;
+                const VkDeviceSize tail_base =
+                    img_reqs.imageMipTailOffset +
+                    (single_miptail ? 0 : VkDeviceSize(layer) * img_reqs.imageMipTailStride);
+                const VkDeviceSize tail_off = VkDeviceSize(coord.X + ti) * wavespan::tile_size_in_bytes;
+                if (tail_off >= img_reqs.imageMipTailSize) continue;
+                VkSparseMemoryBind bind{};
+                bind.resourceOffset = tail_base + tail_off;
+                bind.size = std::min<VkDeviceSize>(wavespan::tile_size_in_bytes, img_reqs.imageMipTailSize - tail_off);
+                bind.memory = mem;
+                bind.memoryOffset = mem_off;
+                opaque_binds.push_back(bind);
+            }
+        }
+    }
+
+    if (buffer_binds.empty() && image_binds.empty() && opaque_binds.empty()) return;
+
+    VkBindSparseInfo bind_info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+    VkSparseBufferMemoryBindInfo buf_info{};
+    if (!buffer_binds.empty()) {
+        buf_info.buffer = r->buffer();
+        buf_info.bindCount = std::uint32_t(buffer_binds.size());
+        buf_info.pBinds = buffer_binds.data();
+        bind_info.bufferBindCount = 1;
+        bind_info.pBufferBinds = &buf_info;
+    }
+    VkSparseImageMemoryBindInfo img_info{};
+    if (!image_binds.empty()) {
+        img_info.image = r->image();
+        img_info.bindCount = std::uint32_t(image_binds.size());
+        img_info.pBinds = image_binds.data();
+        bind_info.imageBindCount = 1;
+        bind_info.pImageBinds = &img_info;
+    }
+    VkSparseImageOpaqueMemoryBindInfo opaque_info{};
+    if (!opaque_binds.empty()) {
+        opaque_info.image = r->image();
+        opaque_info.bindCount = std::uint32_t(opaque_binds.size());
+        opaque_info.pBinds = opaque_binds.data();
+        bind_info.imageOpaqueBindCount = 1;
+        bind_info.pImageOpaqueBinds = &opaque_info;
+    }
+
+    std::lock_guard submit_lock(context.submit_mutex());
+    vk.vkQueueWaitIdle(vk_queue);
+    const VkResult res = vk.vkQueueBindSparse(vk_queue, 1, &bind_info, VK_NULL_HANDLE);
+    if (res == VK_SUCCESS) vk.vkQueueWaitIdle(vk_queue);
+    else log_once("vkQueueBindSparse failed; VkResult", int(res));
 }
 
 }  // namespace rt::d3d12

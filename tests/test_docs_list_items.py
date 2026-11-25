@@ -15,8 +15,27 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ITEM = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+(\S.*)$")
+TABLE_DOC_LINK = re.compile(r"^\|\s*\[[^\]]+\]\(([^)#\s]+)(?:#[^)]*)?\)\s*\|")
 WINDOW = 8      # lines between the two items
 OPENING = 60    # characters of the item's text that must match (after the list marker)
+
+
+def duplicate_table_links(text):
+    """[(target, first_line, dup_line)] for repeated first-column doc links in Markdown tables."""
+    seen, found, in_fence = {}, [], False
+    for n, line in enumerate(text.split("\n"), 1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        m = None if in_fence else TABLE_DOC_LINK.match(line.strip())
+        if not m:
+            continue
+        target = m.group(1)
+        if target in seen:
+            found.append((target, seen[target], n))
+        else:
+            seen[target] = n
+    return found
 
 
 def repeated_items(text):
@@ -66,6 +85,27 @@ class RepeatedListItems(unittest.TestCase):
                 found += [f"{path}:{a} and :{b}" for a, b in repeated_items(f.read())]
         self.assertEqual(found, [], "a list item repeated a few lines later (keep the current copy): " +
                          "; ".join(found))
+
+
+class DuplicateReadmeTableLinks(unittest.TestCase):
+    def test_checker_flags_duplicate_table_link_only(self):
+        text = "\n".join([
+            "| Document | Notes |",
+            "|---|---|",
+            "| [models.md](models.md) | current row |",
+            "| [models.md](models.md) | stale duplicate row |",
+            "| [textures.md](textures.md) | unique row |",
+            "```",
+            "| [textures.md](textures.md) | inside code fence |",
+            "```",
+        ])
+        self.assertEqual(duplicate_table_links(text), [("models.md", 3, 4)])
+
+    def test_docs_readme_has_no_duplicate_table_links(self):
+        with open(os.path.join(ROOT, "docs", "README.md"), encoding="utf-8") as f:
+            found = duplicate_table_links(f.read())
+        self.assertEqual(found, [], "duplicate doc links in docs/README.md tables: " +
+                         "; ".join(f"{t} (lines {a} and {b})" for t, a, b in found))
 
 
 if __name__ == "__main__":

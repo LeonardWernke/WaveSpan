@@ -776,6 +776,10 @@ int main() {
         check(reading->GetControllerButtonState(64, buttons) == SDL_GAMEPAD_BUTTON_COUNT && buttons[SDL_GAMEPAD_BUTTON_SOUTH] &&
                   !buttons[SDL_GAMEPAD_BUTTON_EAST],
               "controller buttons");
+        check(reading->GetControllerAxisState(8, nullptr) == 0 && reading->GetControllerAxisState(0, axes) == 0 &&
+                  reading->GetControllerButtonState(64, nullptr) == 0 &&
+                  reading->GetControllerButtonState(0, buttons) == 0,
+              "controller axis/button state null out or zero count returns 0");
         check(!reading->GetMotionState(nullptr) && !reading->GetMouseState(nullptr), "no motion or mouse state");
         IGameInputReading* none = nullptr;
         check(input->GetNextReading(reading, GameInputKindGamepad, nullptr, &none) == GAMEINPUT_E_READING_NOT_FOUND && !none,

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WaveSpan</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="horizon-glow" aria-hidden="true"></div>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <img class="logo-tile" src="wavespan-mark.png" alt="" />
+        <h1>WaveSpan</h1>
+      </div>
+      <span class="badge-experimental">Experimental runtime</span>
+    </header>
+
+    <main class="workspace-grid">
+      <section class="card overview-card">
+        <div id="heroBanner" class="hero-banner">
+          <span id="heroStatus" class="hero-status" role="status" aria-live="polite">Ready</span>
+          <svg aria-hidden="true" class="wave-motif" viewBox="0 0 320 110" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="neonWave" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#77e1fb" />
+                <stop offset="55%" stop-color="#96adff" />
+                <stop offset="100%" stop-color="#ea6fe0" />
+              </linearGradient>
+            </defs>
+            <path d="M0,72 C55,28 110,98 165,58 C220,18 270,82 320,44" stroke="url(#neonWave)" stroke-width="2.5" fill="none" />
+            <path d="M0,88 C65,48 125,104 185,68 C240,34 285,88 320,62" stroke="#77e1fb" stroke-opacity="0.35" stroke-width="1.5" fill="none" />
+          </svg>
+          <div id="buildGraph" class="build-graph" role="group" aria-label="Build progress" hidden>
+            <p id="stageCount" class="stage-count">0 of 5 stages</p>
+            <ol class="stage-chart">
+              <li class="chart-stage" data-stage="check"><span class="stage-bar" aria-hidden="true"></span>Package</li>
+              <li class="chart-stage" data-stage="shaders"><span class="stage-bar" aria-hidden="true"></span>Shaders</li>
+              <li class="chart-stage" data-stage="assets"><span class="stage-bar" aria-hidden="true"></span>Assets</li>
+              <li class="chart-stage" data-stage="runtime"><span class="stage-bar" aria-hidden="true"></span>Runtime</li>
+              <li class="chart-stage" data-stage="pipelines"><span class="stage-bar" aria-hidden="true"></span>Pipelines</li>
+            </ol>
+            <div class="graph-detail">
+              <span id="graphPhase" role="status">Starting build</span>
+              <span id="graphUnits" class="graph-units"></span>
+            </div>
+            <progress id="graphMeter" class="graph-meter" aria-label="Current task progress" hidden></progress>
+          </div>
+        </div>
+        <div class="overview-body">
+          <h2>Xbox Series to Windows</h2>
+          <p class="muted">Translate shaders, export assets, and build the Windows runtime from your own package.</p>
+          <p class="warning-text">Retail gameplay is unavailable.</p>
+        </div>
+      </section>
+
+      <section class="card setup-card">
+        <div class="setup-header">
+          <h2>Build setup</h2>
+          <button id="scanBtn" class="btn btn-secondary" type="button">Find packages</button>
+        </div>
+
+        <div class="wave-divider" aria-hidden="true"></div>
+
+        <div class="form-row">
+          <label for="gameInput">Game package</label>
+          <div class="input-group">
+            <input id="gameInput" type="text" list="packageList" placeholder="Select or browse for Xbox package…" autocomplete="off" />
+            <datalist id="packageList"></datalist>
+            <button id="browseGameBtn" class="btn btn-secondary" type="button">Browse…</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label for="outputInput">Build destination</label>
+          <div class="input-group">
+            <input id="outputInput" type="text" autocomplete="off" />
+            <button id="browseOutputBtn" class="btn btn-secondary" type="button">Browse…</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label for="workInput">Work folder (optional)</label>
+          <div class="input-group">
+            <input id="workInput" type="text" autocomplete="off" />
+            <button id="browseWorkBtn" class="btn btn-secondary" type="button">Browse…</button>
+          </div>
+          <p class="helper-text">Defaults to the work subfolder in your build destination.</p>
+        </div>
+
+        <label class="checkbox-row">
+          <input id="fullCheckInput" type="checkbox" />
+          <span>Verify every file with SHA-256</span>
+        </label>
+
+        <div class="setup-actions">
+          <button id="checkBtn" class="btn btn-secondary" type="button">Check package</button>
+          <button id="buildBtn" class="btn btn-primary" type="button">Build workspace</button>
+        </div>
+      </section>
+    </main>
+
+    <section class="card activity-card">
+      <div class="activity-toolbar">
+        <h2>Build activity</h2>
+        <div class="toolbar-right">
+          <span id="statusLabel" class="status-label" role="status" aria-live="polite">Ready</span>
+          <button id="stopBtn" class="btn btn-secondary" type="button" disabled>Stop</button>
+        </div>
+      </div>
+
+      <div id="progressTrack" class="progress-track hidden" aria-hidden="true">
+        <div class="progress-bar"></div>
+      </div>
+
+      <div class="console-frame">
+        <pre id="logConsole" class="log-console" role="log" aria-live="polite" tabindex="0">Choose a game package to check its files or start a build.&#10;</pre>
+      </div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

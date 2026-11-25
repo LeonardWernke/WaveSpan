@@ -388,7 +388,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
                 self.assertIn("spirv-as:", err)
                 self.assertIn("spirv-val:", err)
-                self.assertIn(".NET 8 SDK", err)
+                self.assertIn(".NET SDK 8 or newer", err)
                 self.assertIn("Visual Studio 2022", err)
 
     def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
@@ -523,7 +523,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("make_game.dotnet_sdk_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
                 # shaders (30) + assets (300) = 330 GB needed, only 250 GB free
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
@@ -707,7 +707,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     OGG = "awc_opus.py finished\n"
     XMA = "rpf9dump xma finished\n"
 
-    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True):
+    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True, game=None):
         usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
 
         def which(cmd):
@@ -722,7 +722,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
              mock.patch("make_game.ensure_submodule", return_value=None), \
              mock.patch("sys.stdout", io.StringIO()), \
              mock.patch("shutil.disk_usage", return_value=usage):
-            make_game.preflight(["shaders", "assets"], work, wav=wav)
+            make_game.preflight(["shaders", "assets"], work, wav=wav, game=game)
 
     def write_xma(self, work, decoded):
         """One XMA2 stream as the assets stage leaves it, with or without the .wav that ffmpeg decodes it to."""
@@ -735,48 +735,79 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     def write_markers(self, work, ogg=OGG, xma=XMA):
         audio = os.path.join(work, "assets", "audio")
         os.makedirs(audio, exist_ok=True)
+        with open(os.path.join(audio, "audio_manifest.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
         for name, text in (("ogg.done", ogg), ("xma.done", xma)):
             if text is not None:
                 with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
                     f.write(text)
 
+    def write_archive_manifests(self, work):
+        for rel in make_game.MODEL_ARCHIVES:
+            name = os.path.splitext(os.path.basename(rel))[0]
+            for mode in ("models", "textures"):
+                directory = os.path.join(work, "assets", name, mode)
+                os.makedirs(directory)
+                with open(os.path.join(directory, "manifest.json"), "w", encoding="utf-8") as f:
+                    f.write("{}")
+
     def test_markers_written_by_assets_are_read_back(self):
         with tempfile.TemporaryDirectory() as work:
             audio = os.path.join(work, "assets", "audio")
-            os.makedirs(audio)
+            self.write_markers(work, ogg=None, xma=None)
             make_game.mark(os.path.join(audio, "ogg.done"), "awc_opus.py")
             make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
-            self.assertTrue(make_game.assets_exported(work))
+            self.assertTrue(make_game.audio_exported(work))
+
+    def test_archives_are_reused_before_audio_starts(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_archive_manifests(work)
+            self.run_preflight(work, free_gb=227)
+            self.assert_fails(self.run_preflight, work, free_gb=179, match="about 180 GB is needed")
+
+            name = os.path.splitext(os.path.basename(make_game.MODEL_ARCHIVES[-1]))[0]
+            os.remove(os.path.join(work, "assets", name, "textures", "manifest.json"))
+            self.assert_fails(self.run_preflight, work, free_gb=227, match="about 330 GB is needed")
 
     def test_exported_assets_need_only_the_shader_space(self):
-        with tempfile.TemporaryDirectory() as work:
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as game:
+            self.write_archive_manifests(work)
             self.write_markers(work)
-            self.run_preflight(work, free_gb=220)  # 30 GB for the shaders, not 330
-            err = self.assert_fails(self.run_preflight, work, free_gb=20, match="about 30 GB is needed")
-            self.assertIn("20 GB free", err)
+            directory = os.path.join(work, "assets", "ttpf", "pool")
+            os.makedirs(directory)
+            with open(os.path.join(game, "pool.ttpf"), "wb"):
+                pass
+            with open(os.path.join(directory, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"Count": 1, "Textures": [{"File": "sample.dds"}]}, f)
+
+            self.assert_fails(self.run_preflight, work, free_gb=40, game=game, match="about 120 GB is needed")
+            with open(os.path.join(directory, "sample.dds"), "wb"):
+                pass
+            self.run_preflight(work, free_gb=40, game=game)
+            self.assert_fails(self.run_preflight, work, free_gb=20, game=game, match="about 30 GB is needed")
 
     def test_fresh_work_folder_still_needs_the_asset_space(self):
         with tempfile.TemporaryDirectory() as work:
-            self.assertFalse(make_game.assets_exported(work))
+            self.assertFalse(make_game.audio_exported(work))
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
 
     def test_stopped_export_still_needs_the_asset_space(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)  # stopped before the XMA2 step
-            self.assertFalse(make_game.assets_exported(work))
+            self.assertFalse(make_game.audio_exported(work))
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
 
     def test_marker_with_other_contents_does_not_count(self):
         for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
             with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
                 self.write_markers(work, ogg=ogg, xma=xma)
-                self.assertFalse(make_game.assets_exported(work))
+                self.assertFalse(make_game.audio_exported(work))
 
     def test_marker_that_is_a_folder_does_not_count(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)
             os.makedirs(os.path.join(work, "assets", "audio", "xma.done"))
-            self.assertFalse(make_game.assets_exported(work))
+            self.assertFalse(make_game.audio_exported(work))
 
     def test_xma_streams_ffmpeg_will_decode_still_need_the_asset_space(self):
         # xma.done is written without ffmpeg too; once ffmpeg is on PATH every run decodes the streams with no .wav.
@@ -790,13 +821,13 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
             self.write_xma(work, decoded=False)
-            self.run_preflight(work, free_gb=220, ffmpeg=False)
+            self.run_preflight(work, free_gb=270, ffmpeg=False)
 
     def test_decoded_xma_streams_need_only_the_shader_space(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
             self.write_xma(work, decoded=True)
-            self.run_preflight(work, free_gb=220)
+            self.run_preflight(work, free_gb=270)
 
     def test_pending_xma_lists_only_streams_without_a_wav(self):
         with tempfile.TemporaryDirectory() as work:

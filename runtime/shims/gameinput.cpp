@@ -187,13 +187,15 @@ public:
     }
     uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
-        const uint32_t n = out ? std::min(count, kAxisCount) : 0;
+        if (!out || count == 0) return 0;
+        const uint32_t n = std::min(count, kAxisCount);
         std::memcpy(out, s_.axes, n * sizeof(float));
         return n;
     }
     uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
     uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
-        const uint32_t n = out ? std::min(count, kButtonCount) : 0;
+        if (!out || count == 0) return 0;
+        const uint32_t n = std::min(count, kButtonCount);
         std::memcpy(out, s_.buttons, n * sizeof(bool));
         return n;
     }

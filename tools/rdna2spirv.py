@@ -19,9 +19,12 @@ Writes <name>.spvasm for each translated shader and <name>.spv only for validate
 Prints coverage and validation results.
 """
 import argparse
+import atexit
+import ctypes
 import hashlib
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -11572,9 +11575,172 @@ def merge_shard_parts(out):
     return merged
 
 
-def assemble_spirv(sa, sv):
-    """Keep the assembled module out of the final path until validation succeeds."""
-    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
+_REAL_SUBPROCESS_RUN = subprocess.run
+_SPIRV_TOOLS_CACHE = None  # None = uninitialized, False = unavailable, tuple = (lib, ctx, val_opts, SpvBinary, SpvDiagnostic)
+
+
+class _SpvBinary(ctypes.Structure):
+    _fields_ = [("code", ctypes.POINTER(ctypes.c_uint32)), ("wordCount", ctypes.c_size_t)]
+
+
+class _SpvPosition(ctypes.Structure):
+    _fields_ = [("line", ctypes.c_size_t), ("column", ctypes.c_size_t), ("index", ctypes.c_size_t)]
+
+
+class _SpvDiagnostic(ctypes.Structure):
+    _fields_ = [("position", _SpvPosition), ("error", ctypes.c_char_p), ("isTextSource", ctypes.c_bool)]
+
+
+def _find_spirv_tools_dll():
+    """Return candidate paths/names for the SPIRV-Tools shared library."""
+    if sys.platform == "win32":
+        lib_name = "SPIRV-Tools-shared.dll"
+        sdk_subdir = "Bin"
+    elif sys.platform == "darwin":
+        lib_name = "libSPIRV-Tools-shared.dylib"
+        sdk_subdir = "lib"
+    else:
+        lib_name = "libSPIRV-Tools-shared.so"
+        sdk_subdir = "lib"
+    candidates = []
+    spirv_as = shutil.which("spirv-as")
+    if spirv_as:
+        sibling = os.path.join(os.path.dirname(spirv_as), lib_name)
+        if os.path.isfile(sibling):
+            candidates.append(sibling)
+    sdk = os.environ.get("VULKAN_SDK")
+    if sdk:
+        sdk_lib = os.path.join(sdk, sdk_subdir, lib_name)
+        if os.path.isfile(sdk_lib) and sdk_lib not in candidates:
+            candidates.append(sdk_lib)
+    candidates.append(lib_name)
+    return candidates
+
+
+def _get_spirv_tools():
+    """Lazily load SPIRV-Tools-shared for in-process assembly and validation, or None if unavailable."""
+    global _SPIRV_TOOLS_CACHE
+    if _SPIRV_TOOLS_CACHE is False:
+        return None
+    if _SPIRV_TOOLS_CACHE is not None:
+        return _SPIRV_TOOLS_CACHE
+
+    bin_ptr_t = ctypes.POINTER(_SpvBinary)
+    diag_ptr_t = ctypes.POINTER(_SpvDiagnostic)
+    for candidate in _find_spirv_tools_dll():
+        try:
+            lib = ctypes.CDLL(candidate)
+            lib.spvParseTargetEnv.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+            lib.spvParseTargetEnv.restype = ctypes.c_bool
+            lib.spvContextCreate.argtypes = [ctypes.c_int]
+            lib.spvContextCreate.restype = ctypes.c_void_p
+            lib.spvContextDestroy.argtypes = [ctypes.c_void_p]
+            lib.spvContextDestroy.restype = None
+            lib.spvValidatorOptionsCreate.argtypes = []
+            lib.spvValidatorOptionsCreate.restype = ctypes.c_void_p
+            lib.spvValidatorOptionsDestroy.argtypes = [ctypes.c_void_p]
+            lib.spvValidatorOptionsDestroy.restype = None
+            lib.spvValidatorOptionsSetAllowOffsetTextureOperand.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+            lib.spvValidatorOptionsSetAllowOffsetTextureOperand.restype = None
+            lib.spvTextToBinary.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.POINTER(bin_ptr_t), ctypes.POINTER(diag_ptr_t),
+            ]
+            lib.spvTextToBinary.restype = ctypes.c_int
+            lib.spvValidateWithOptions.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, bin_ptr_t, ctypes.POINTER(diag_ptr_t),
+            ]
+            lib.spvValidateWithOptions.restype = ctypes.c_int
+            lib.spvBinaryDestroy.argtypes = [bin_ptr_t]
+            lib.spvBinaryDestroy.restype = None
+            lib.spvDiagnosticDestroy.argtypes = [diag_ptr_t]
+            lib.spvDiagnosticDestroy.restype = None
+        except (OSError, AttributeError):
+            continue
+
+        env = ctypes.c_int()
+        if not lib.spvParseTargetEnv(b"vulkan1.2", ctypes.byref(env)):
+            continue
+        ctx = lib.spvContextCreate(env.value)
+        if not ctx:
+            continue
+        val_opts = lib.spvValidatorOptionsCreate()
+        if not val_opts:
+            lib.spvContextDestroy(ctx)
+            continue
+        # Offset on non-gather: VK_KHR_maintenance8
+        lib.spvValidatorOptionsSetAllowOffsetTextureOperand(val_opts, True)
+
+        def _cleanup(l=lib, c=ctx, o=val_opts):
+            l.spvValidatorOptionsDestroy(o)
+            l.spvContextDestroy(c)
+
+        atexit.register(_cleanup)
+        _SPIRV_TOOLS_CACHE = (lib, ctx, val_opts, bin_ptr_t, diag_ptr_t)
+        return _SPIRV_TOOLS_CACHE
+
+    _SPIRV_TOOLS_CACHE = False
+    return None
+
+
+def _format_spv_diagnostic(diag):
+    if not diag:
+        return "SPIRV-Tools error"
+    d = diag.contents
+    msg = d.error.decode("utf-8", errors="replace") if d.error else "SPIRV-Tools error"
+    if d.isTextSource:
+        return f"error: line {d.position.line + 1}: {msg}"
+    return f"error: line {d.position.index}: {msg}" if d.position.index else f"error: {msg}"
+
+
+def _assemble_spirv_lib(tools, sa, sv):
+    """Assemble and validate in-process via SPIRV-Tools-shared."""
+    lib, ctx, val_opts, bin_ptr_t, diag_ptr_t = tools
+    text_bytes = Path(sa).read_bytes()
+    binary = bin_ptr_t()
+    diag = diag_ptr_t()
+    try:
+        res = lib.spvTextToBinary(ctx, text_bytes, len(text_bytes), ctypes.byref(binary), ctypes.byref(diag))
+        if res != 0:
+            Path(sv).unlink(missing_ok=True)
+            return subprocess.CompletedProcess(
+                ["spirv-as", sa, "-o", str(sv), "--target-env", "vulkan1.2"],
+                1, "", _format_spv_diagnostic(diag),
+            )
+        if diag:
+            lib.spvDiagnosticDestroy(diag)
+            diag = diag_ptr_t()
+        vres = lib.spvValidateWithOptions(ctx, val_opts, binary, ctypes.byref(diag))
+        if vres != 0:
+            Path(sv).unlink(missing_ok=True)
+            return subprocess.CompletedProcess(
+                ["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", str(sv)],
+                1, "", _format_spv_diagnostic(diag),
+            )
+        raw = ctypes.string_at(binary.contents.code, binary.contents.wordCount * 4)
+    finally:
+        if diag:
+            lib.spvDiagnosticDestroy(diag)
+        if binary:
+            lib.spvBinaryDestroy(binary)
+
+    out_dir = os.path.dirname(sv) or "."
+    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=out_dir, delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        tmp.write_bytes(raw)
+        tmp.replace(sv)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return subprocess.CompletedProcess(
+        ["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", str(sv)],
+        0, "", "",
+    )
+
+
+def _assemble_spirv_subprocess(sa, sv):
+    """Subprocess fallback using spirv-as and spirv-val."""
+    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv) or ".", delete=False) as f:
         tmp = Path(f.name)
     try:
         result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
@@ -11590,6 +11756,15 @@ def assemble_spirv(sa, sv):
         return result
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def assemble_spirv(sa, sv):
+    """Keep the assembled module out of the final path until validation succeeds."""
+    if subprocess.run is _REAL_SUBPROCESS_RUN:
+        tools = _get_spirv_tools()
+        if tools is not None:
+            return _assemble_spirv_lib(tools, sa, sv)
+    return _assemble_spirv_subprocess(sa, sv)
 
 
 def _limit_arg(text):

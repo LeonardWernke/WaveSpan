@@ -81,6 +81,7 @@ const char* slot_name(unsigned slot) {
         case 9: return "CreateCommandAllocator (PC slot 9)";
         case 10: return "CreateGraphicsPipelineState (PC slot 10)";
         case 11: return "CreateComputePipelineState (PC slot 11)";
+        case 12: return "CreateCommandList -> list proxy";
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
@@ -94,6 +95,7 @@ const char* slot_name(unsigned slot) {
         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 51: return "CreateCommandList1 -> list proxy";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 75: return "CreateCommandQueue1 -> queue proxy";
@@ -396,7 +398,7 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 // CreateCommandList and Reset and only the Vulkan layer's lists resolve a proxy there (CommandAllocator::from);
 // a PC runtime allocator is handed out unchanged until a command-list proxy unwraps it at Reset.
 
-enum class ChildKind { queue, fence, allocator };
+enum class ChildKind { queue, fence, allocator, list };
 
 constexpr unsigned kQueueSlots = 128;        // the table: 19 public slots plus a refused tail
 constexpr unsigned kFenceSlots = 64;         // the table: 12 public slots plus a refused tail
@@ -405,15 +407,21 @@ constexpr unsigned kFencePublicSlots = 11;   // ID3D12Fence
 constexpr unsigned kFence1PublicSlots = 12;  // ID3D12Fence1
 constexpr unsigned kAllocatorSlots = 64;     // the table: 9 public slots plus a refused tail
 constexpr unsigned kAllocatorPublicSlots = 9;  // ID3D12CommandAllocator: the base chain and Reset (slot 8)
+constexpr unsigned kListSlots = 256;         // the table: up to 82 public slots plus a refused tail
+constexpr unsigned kListPublicSlots = 60;    // ID3D12GraphicsCommandList
+constexpr unsigned kList8PublicSlots = 82;   // ID3D12GraphicsCommandList8
 constexpr SIZE_T kTableRegion = 64 * 1024;   // one allocation granule: the table page plus 15 never-committed pages
 static_assert(kQueueSlots > kQueuePublicSlots && kFenceSlots > kFence1PublicSlots &&
-                  kAllocatorSlots > kAllocatorPublicSlots,
+                  kAllocatorSlots > kAllocatorPublicSlots && kListSlots > kList8PublicSlots,
               "the tables need a tail");
 static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*) <= 4096 &&
-                  kAllocatorSlots * sizeof(void*) <= 4096,
+                  kAllocatorSlots * sizeof(void*) <= 4096 && kListSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
-constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
+constexpr unsigned kQueueExecuteCommandLists = 10;          // (UINT, ID3D12CommandList* const*)
+constexpr unsigned kQueueSignal = 14, kQueueWait = 15;      // (ID3D12Fence*, UINT64)
+constexpr unsigned kListReset = 10;                         // (ID3D12CommandAllocator*, ID3D12PipelineState*)
+constexpr unsigned kListSetDescriptorHeaps = 28;            // (UINT, ID3D12DescriptorHeap* const*)
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -426,9 +434,10 @@ struct ChildProxy {
 
 template <ChildKind K>
 struct ChildStats {
-    static constexpr unsigned kSlots = K == ChildKind::queue   ? kQueueSlots
-                                       : K == ChildKind::fence ? kFenceSlots
-                                                               : kAllocatorSlots;
+    static constexpr unsigned kSlots = K == ChildKind::queue       ? kQueueSlots
+                                       : K == ChildKind::fence     ? kFenceSlots
+                                       : K == ChildKind::allocator ? kAllocatorSlots
+                                                                   : kListSlots;
     static inline std::atomic<std::uint64_t> hits[kSlots];
     static inline std::atomic<bool> first[kSlots];
     static inline std::atomic<bool> beyond_warned[kSlots];
@@ -439,7 +448,10 @@ struct ChildStats {
 
 template <ChildKind K>
 constexpr const char* child_kind_name() {
-    return K == ChildKind::queue ? "queue" : K == ChildKind::fence ? "fence" : "allocator";
+    return K == ChildKind::queue       ? "queue"
+           : K == ChildKind::fence     ? "fence"
+           : K == ChildKind::allocator ? "allocator"
+                                       : "list";
 }
 
 template <ChildKind K>
@@ -451,13 +463,91 @@ const char* child_public_name(unsigned slot) {
                                             "GetTimestampFrequency", "GetClockCalibration", "GetDesc"};
     static constexpr const char* fence[] = {"GetCompletedValue", "SetEventOnCompletion", "Signal",
                                             "GetCreationFlags"};
+    static constexpr const char* list[] = {
+        "GetType",
+        "Close",
+        "Reset",
+        "ClearState",
+        "DrawInstanced",
+        "DrawIndexedInstanced",
+        "Dispatch",
+        "CopyBufferRegion",
+        "CopyTextureRegion",
+        "CopyResource",
+        "CopyTiles",
+        "ResolveSubresource",
+        "IASetPrimitiveTopology",
+        "RSSetViewports",
+        "RSSetScissorRects",
+        "OMSetBlendFactor",
+        "OMSetStencilRef",
+        "SetPipelineState",
+        "ResourceBarrier",
+        "ExecuteBundle",
+        "SetDescriptorHeaps",
+        "SetComputeRootSignature",
+        "SetGraphicsRootSignature",
+        "SetComputeRootDescriptorTable",
+        "SetGraphicsRootDescriptorTable",
+        "SetComputeRoot32BitConstant",
+        "SetGraphicsRoot32BitConstant",
+        "SetComputeRoot32BitConstants",
+        "SetGraphicsRoot32BitConstants",
+        "SetComputeRootConstantBufferView",
+        "SetGraphicsRootConstantBufferView",
+        "SetComputeRootShaderResourceView",
+        "SetGraphicsRootShaderResourceView",
+        "SetComputeRootUnorderedAccessView",
+        "SetGraphicsRootUnorderedAccessView",
+        "IASetIndexBuffer",
+        "IASetVertexBuffers",
+        "SOSetTargets",
+        "OMSetRenderTargets",
+        "ClearDepthStencilView",
+        "ClearRenderTargetView",
+        "ClearUnorderedAccessViewUint",
+        "ClearUnorderedAccessViewFloat",
+        "DiscardResource",
+        "BeginQuery",
+        "EndQuery",
+        "ResolveQueryData",
+        "SetPredication",
+        "SetMarker",
+        "BeginEvent",
+        "EndEvent",
+        "ExecuteIndirect",
+        "AtomicCopyBufferUINT",
+        "AtomicCopyBufferUINT64",
+        "OMSetDepthBounds",
+        "SetSamplePositions",
+        "ResolveSubresourceRegion",
+        "SetViewInstanceMask",
+        "WriteBufferImmediate",
+        "SetProtectedResourceSession",
+        "BeginRenderPass",
+        "EndRenderPass",
+        "InitializeMetaCommand",
+        "ExecuteMetaCommand",
+        "BuildRaytracingAccelerationStructure",
+        "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure",
+        "SetPipelineState1",
+        "DispatchRays",
+        "RSSetShadingRate",
+        "RSSetShadingRateImage",
+        "DispatchMesh",
+        "Barrier",
+        "OMSetFrontAndBackStencilRef",
+    };
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
-    } else {
+    } else if constexpr (K == ChildKind::allocator) {
         if (slot == 8) return "Reset";
+    } else {
+        if (slot < kList8PublicSlots) return list[slot - 8];
     }
     return nullptr;
 }
@@ -468,10 +558,11 @@ const char* child_public_name(unsigned slot) {
 template <ChildKind K>
 const char* child_trace_name(unsigned slot) {
     static const auto names = [] {
-        static char storage[ChildStats<K>::kSlots][64];
-        const char* iface = K == ChildKind::queue   ? "XboxID3D12CommandQueue"
-                            : K == ChildKind::fence ? "XboxID3D12Fence"
-                                                    : "XboxID3D12CommandAllocator";
+        static char storage[ChildStats<K>::kSlots][96];
+        const char* iface = K == ChildKind::queue       ? "XboxID3D12CommandQueue"
+                            : K == ChildKind::fence     ? "XboxID3D12Fence"
+                            : K == ChildKind::allocator ? "XboxID3D12CommandAllocator"
+                                                        : "XboxID3D12GraphicsCommandList";
         for (unsigned s = 0; s < ChildStats<K>::kSlots; ++s) {
             const char* method = child_public_name<K>(s);
             if (method)
@@ -541,14 +632,28 @@ unsigned long child_release(ChildProxy* self) {
 template <ChildKind K>
 bool is_child_iid(const IID& iid) {
     if (IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
-        IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12Pageable)))
+        IsEqualIID(iid, __uuidof(ID3D12DeviceChild)))
         return true;
-    if constexpr (K == ChildKind::queue) {
-        return IsEqualIID(iid, __uuidof(ID3D12CommandQueue));
-    } else if constexpr (K == ChildKind::fence) {
-        return IsEqualIID(iid, __uuidof(ID3D12Fence)) || IsEqualIID(iid, __uuidof(ID3D12Fence1));
+    if constexpr (K == ChildKind::list) {
+        return IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList1)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList2)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList3)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList4)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList5)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7)) ||
+               IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
     } else {
-        return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator));
+        if (IsEqualIID(iid, __uuidof(ID3D12Pageable))) return true;
+        if constexpr (K == ChildKind::queue) {
+            return IsEqualIID(iid, __uuidof(ID3D12CommandQueue));
+        } else if constexpr (K == ChildKind::fence) {
+            return IsEqualIID(iid, __uuidof(ID3D12Fence)) || IsEqualIID(iid, __uuidof(ID3D12Fence1));
+        } else {
+            return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator));
+        }
     }
 }
 
@@ -621,14 +726,15 @@ bool is_child_proxy(const void* object) {
     return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
 }
 
-// The real object behind a heap, queue or fence proxy, or null when `object` is none of them.
+// The real object behind a heap, queue, fence, allocator or command-list proxy, or null when `object` is none of them.
 IUnknown* proxy_real_object(const void* object) {
     if (!object) return nullptr;
     void* const vtable = *reinterpret_cast<void* const*>(object);
     if (vtable == reinterpret_cast<void*>(get_heap_vtable())) return static_cast<const HeapProxy*>(object)->real;
     if (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::queue>()) ||
         vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) ||
-        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()))
+        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()) ||
+        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::list>()))
         return static_cast<const ChildProxy*>(object)->real;
     return nullptr;
 }
@@ -706,6 +812,7 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
         report_table_overrun<ChildKind::queue>(address);
         report_table_overrun<ChildKind::fence>(address);
         report_table_overrun<ChildKind::allocator>(address);
+        report_table_overrun<ChildKind::list>(address);
     }
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
@@ -744,7 +851,18 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        UnwrappedArray unwrapped;
+        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) {
+            a1 = unwrap_object(a1);
+        } else if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
+            if (!unwrapped.fill(a2, a1)) return 0;  // void return; never pass proxy pointers to the real queue
+            if (unwrapped.data()) a2 = unwrapped.data();
+        } else if constexpr (K == ChildKind::list && Slot == kListReset) {
+            a1 = unwrap_object(a1);
+        } else if constexpr (K == ChildKind::list && Slot == kListSetDescriptorHeaps) {
+            if (!unwrapped.fill(a2, a1)) return 0;  // void return; never pass proxy pointers to the real list
+            if (unwrapped.data()) a2 = unwrapped.data();
+        }
 
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
         // pointer and stack arguments keep their positions, as in the device proxy.
@@ -808,6 +926,18 @@ void** get_child_vtable() {
     return vtable;
 }
 
+unsigned detect_list_slot_count(IUnknown* real) {
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList8))) return kList8PublicSlots;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList7))) return 81;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList6))) return 80;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList5))) return 79;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList4))) return 77;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList3))) return 68;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList2))) return 67;
+    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList1))) return 66;
+    return kListPublicSlots;
+}
+
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
 template <ChildKind K>
@@ -826,8 +956,10 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kQueuePublicSlots;
     } else if constexpr (K == ChildKind::fence) {
         proxy->slot_count = supports_iid(created, __uuidof(ID3D12Fence1)) ? kFence1PublicSlots : kFencePublicSlots;
-    } else {
+    } else if constexpr (K == ChildKind::allocator) {
         proxy->slot_count = kAllocatorPublicSlots;
+    } else {
+        proxy->slot_count = detect_list_slot_count(created);
     }
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
@@ -952,6 +1084,42 @@ HRESULT proxy_create_command_allocator(DeviceProxy* self, std::uint64_t type, co
         return asked;
     }
     return wrap_child<ChildKind::allocator>(allocator, self, riid, out);
+}
+
+// Device slot 12: CreateCommandList(node_mask, type, allocator, initial_state, riid, out).
+// Unwraps `allocator` if it is an allocator proxy and wraps the created list in a command-list proxy.
+HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, std::uint64_t type,
+                                  std::uint64_t allocator, std::uint64_t initial_state, const IID* riid, void** out) {
+    note_slot(12);
+    if (out) *out = nullptr;
+    if (!riid) return E_POINTER;
+    const auto mask = static_cast<UINT>(static_cast<std::uint32_t>(node_mask));
+    const auto list_type = static_cast<D3D12_COMMAND_LIST_TYPE>(static_cast<std::uint32_t>(type));
+    auto* real_allocator = reinterpret_cast<ID3D12CommandAllocator*>(unwrap_object(allocator));
+    auto* pso = reinterpret_cast<ID3D12PipelineState*>(initial_state);
+#pragma warning(suppress : 6387)  // the caller's null output, on purpose (see slot 8)
+    if (!out) return self->real->CreateCommandList(mask, list_type, real_allocator, pso, *riid, nullptr);
+    void* created = nullptr;
+    const HRESULT hr = self->real->CreateCommandList(mask, list_type, real_allocator, pso,
+                                                     __uuidof(ID3D12GraphicsCommandList), &created);
+    if (FAILED(hr)) return hr;
+    return wrap_child<ChildKind::list>(static_cast<IUnknown*>(created), self, riid, out);
+}
+
+// Device slot 51: ID3D12Device4::CreateCommandList1(node_mask, type, flags, riid, out), called by slot index.
+HRESULT proxy_create_command_list1(DeviceProxy* self, std::uint64_t node_mask, std::uint64_t type,
+                                   std::uint64_t flags, const IID* riid, void** out) {
+    note_slot(51);
+    if (out) *out = nullptr;
+    if (self->slot_count <= 51) return refuse_beyond_device(51, self->slot_count);  // predates ID3D12Device4
+    if (!riid) return E_POINTER;
+    using Fn = HRESULT(WINAPI*)(ID3D12Device*, std::uint64_t, std::uint64_t, std::uint64_t, const IID*, void**);
+    const auto create = reinterpret_cast<Fn>(self->real_vtable[51]);
+    if (!out) return create(self->real, node_mask, type, flags, riid, nullptr);
+    void* created = nullptr;
+    const HRESULT hr = create(self->real, node_mask, type, flags, &__uuidof(ID3D12GraphicsCommandList), &created);
+    if (FAILED(hr)) return hr;
+    return wrap_child<ChildKind::list>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
 // Device slot 32: OpenSharedHandle(handle, riid, out). The object is opened as asked; when it is a fence (whatever
@@ -1142,6 +1310,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 12) {
+        return hr_to_u64(proxy_create_command_list(self, a1, a2, a3, a4, reinterpret_cast<const IID*>(a5),
+                                                   reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 36) {
         return hr_to_u64(proxy_create_fence(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                             reinterpret_cast<void**>(a4)));
@@ -1150,6 +1321,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 51) {
+        return hr_to_u64(proxy_create_command_list1(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
+                                                    reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
@@ -1295,18 +1469,24 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-           slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-           slot == 75 || slot == 76;
+    return slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || slot == 31 || slot == 32 ||
+           slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 51 ||
+           slot == 62 || slot == 67 || slot == 75 || slot == 76;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }
 bool is_fence_proxy(const void* fence) { return is_child_proxy<ChildKind::fence>(fence); }
 bool is_allocator_proxy(const void* allocator) { return is_child_proxy<ChildKind::allocator>(allocator); }
+bool is_list_proxy(const void* list) { return is_child_proxy<ChildKind::list>(list); }
 
 ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator) {
     if (!is_allocator_proxy(allocator)) return nullptr;
     return reinterpret_cast<ID3D12CommandAllocator*>(static_cast<const ChildProxy*>(allocator)->real);
+}
+
+ID3D12GraphicsCommandList* list_proxy_real_list(const void* list) {
+    if (!is_list_proxy(list)) return nullptr;
+    return reinterpret_cast<ID3D12GraphicsCommandList*>(static_cast<const ChildProxy*>(list)->real);
 }
 
 ID3D12CommandQueue* queue_proxy_real_queue(const void* queue) {
@@ -1330,12 +1510,18 @@ unsigned fence_proxy_slot_count(const void* fence) {
 unsigned queue_proxy_table_size() { return kQueueSlots; }
 unsigned fence_proxy_table_size() { return kFenceSlots; }
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
+unsigned list_proxy_table_size() { return kListSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
     return is_allocator_proxy(allocator) ? static_cast<const ChildProxy*>(allocator)->slot_count : 0;
 }
+unsigned list_proxy_slot_count(const void* list) {
+    return is_list_proxy(list) ? static_cast<const ChildProxy*>(list)->slot_count : 0;
+}
 
 unsigned long command_object_proxy_ref_count(const void* object) {
-    if (!is_queue_proxy(object) && !is_fence_proxy(object) && !is_allocator_proxy(object)) return 0;
+    if (!is_queue_proxy(object) && !is_fence_proxy(object) && !is_allocator_proxy(object) &&
+        !is_list_proxy(object))
+        return 0;
     return static_cast<const ChildProxy*>(object)->refs.load(std::memory_order_relaxed);
 }
 
@@ -1371,9 +1557,11 @@ bool command_object_tables_guarded() {
     get_child_vtable<ChildKind::queue>();
     get_child_vtable<ChildKind::fence>();
     get_child_vtable<ChildKind::allocator>();
+    get_child_vtable<ChildKind::list>();
     return ChildStats<ChildKind::queue>::table_end.load(std::memory_order_acquire) &&
            ChildStats<ChildKind::fence>::table_end.load(std::memory_order_acquire) &&
-           ChildStats<ChildKind::allocator>::table_end.load(std::memory_order_acquire);
+           ChildStats<ChildKind::allocator>::table_end.load(std::memory_order_acquire) &&
+           ChildStats<ChildKind::list>::table_end.load(std::memory_order_acquire);
 }
 
 std::uint64_t allocator_slot_hits(unsigned slot) {
@@ -1388,6 +1576,20 @@ bool allocator_slot_first_call_seen(unsigned slot) {
 
 std::uint64_t allocator_table_overruns() {
     return ChildStats<ChildKind::allocator>::overruns.load(std::memory_order_relaxed);
+}
+
+std::uint64_t list_slot_hits(unsigned slot) {
+    using S = ChildStats<ChildKind::list>;
+    return slot < S::kSlots ? S::hits[slot].load(std::memory_order_relaxed) : 0;
+}
+
+bool list_slot_first_call_seen(unsigned slot) {
+    using S = ChildStats<ChildKind::list>;
+    return slot < S::kSlots && S::first[slot].load(std::memory_order_relaxed);
+}
+
+std::uint64_t list_table_overruns() {
+    return ChildStats<ChildKind::list>::overruns.load(std::memory_order_relaxed);
 }
 
 bool heap_slot_overridden(unsigned slot) {
@@ -1428,6 +1630,7 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::queue>();
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
+    reset_child_stats<ChildKind::list>();
 }
 
 }  // namespace rt::d3d12_xs

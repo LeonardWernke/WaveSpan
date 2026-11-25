@@ -249,10 +249,6 @@ class ValidatedOutput(unittest.TestCase):
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EmptyShader(unittest.TestCase):
     """A .s with no tab-indented instruction parses to an empty shader.
 
@@ -274,3 +270,69 @@ class EmptyShader(unittest.TestCase):
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
             self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))
+
+
+class SpirvToolsFastPath(unittest.TestCase):
+    def test_fallback_to_subprocess_when_shared_lib_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa = os.path.join(tmp, "t.spvasm")
+            sv = os.path.join(tmp, "t.spv")
+            Path(sa).write_text("OpCapability Shader\n", encoding="utf-8")
+            calls = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd[0])
+                if cmd[0] == "spirv-as":
+                    Path(cmd[3]).write_bytes(b"mod")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(rdna2spirv, "_get_spirv_tools", return_value=None), \
+                    mock.patch.object(rdna2spirv.subprocess, "run", side_effect=fake_run):
+                res = rdna2spirv.assemble_spirv(sa, sv)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(calls, ["spirv-as", "spirv-val"])
+            self.assertEqual(Path(sv).read_bytes(), b"mod")
+
+    def test_in_process_assemble_and_validate(self):
+        tools = rdna2spirv._get_spirv_tools()
+        if tools is None:
+            self.skipTest("SPIRV-Tools-shared library not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            sa = os.path.join(tmp, "valid.spvasm")
+            sv = os.path.join(tmp, "valid.spv")
+            Path(sa).write_text(
+                'OpCapability Shader\n'
+                'OpMemoryModel Logical GLSL450\n'
+                'OpEntryPoint Fragment %main "main"\n'
+                'OpExecutionMode %main OriginUpperLeft\n'
+                '%void = OpTypeVoid\n'
+                '%fn = OpTypeFunction %void\n'
+                '%main = OpFunction %void None %fn\n'
+                '%entry = OpLabel\n'
+                'OpReturn\n'
+                'OpFunctionEnd\n',
+                encoding="utf-8",
+            )
+            res = rdna2spirv.assemble_spirv(sa, sv)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            data = Path(sv).read_bytes()
+            self.assertEqual(int.from_bytes(data[:4], "little"), 0x07230203)
+
+            # Syntax error in assembler rejects and removes stale .spv
+            Path(sa).write_text("OpNotAnOpcode\n", encoding="utf-8")
+            res_as = rdna2spirv.assemble_spirv(sa, sv)
+            self.assertNotEqual(res_as.returncode, 0)
+            self.assertTrue(res_as.stderr)
+            self.assertFalse(os.path.exists(sv))
+
+            # Validation error rejects and does not publish .spv
+            Path(sv).write_bytes(b"stale")
+            Path(sa).write_text("OpMemoryModel Logical GLSL450\n", encoding="utf-8")
+            res_val = rdna2spirv.assemble_spirv(sa, sv)
+            self.assertNotEqual(res_val.returncode, 0)
+            self.assertTrue(res_val.stderr)
+            self.assertFalse(os.path.exists(sv))
+
+
+if __name__ == "__main__":
+    unittest.main()

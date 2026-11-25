@@ -56,14 +56,19 @@ def candidate(row, profile):
             or row.get("Mips", 0) < row.get("SourceMips", 0))
 
 
-def complete_pool(source, directory, manifest, settings):
-    """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
+def pending_rows(manifest, settings):
     stamp, profile = settings
     if manifest.get("BCPackPass") == stamp:
-        return 0, 0
-    rows = [row for row in manifest["Textures"] if candidate(row, profile)]
+        return []
+    return [row for row in manifest["Textures"] if candidate(row, profile)]
+
+
+def complete_pool(source, directory, manifest, settings):
+    """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
+    rows = pending_rows(manifest, settings)
     if not rows:
         return 0, 0
+    stamp, profile = settings
     directory = Path(directory)
     written = blocked = 0
     with closing(ttpf.Pool(source)) as pool:

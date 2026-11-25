@@ -60,9 +60,10 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
-// and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
-// slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
+// proxies), 9 (allocator proxies), 12 and 51 (command-list proxies), 14, 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 62, 67 and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion
+// is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for the allocator
+// proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
@@ -76,7 +77,7 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
-// Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
+// Live references on a queue, fence, allocator or command-list proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.
 std::uint64_t queue_slot_hits(unsigned slot);
@@ -86,9 +87,22 @@ bool fence_slot_first_call_seen(unsigned slot);
 // Vtable reads past a queue or fence proxy table that faulted in its guard region (counted by the fault logger).
 std::uint64_t queue_table_overruns();
 std::uint64_t fence_table_overruns();
-// True when the queue, fence and allocator tables sit in front of their guard regions (false only if a reservation
-// or the fault logger failed).
+// True when the queue, fence, allocator and command-list tables sit in front of their guard regions (false only if
+// a reservation or the fault logger failed).
 bool command_object_tables_guarded();
+
+// Command-list proxies (device slots 12 CreateCommandList and 51 CreateCommandList1): the public chain (60 to 82
+// slots across ID3D12GraphicsCommandList through ID3D12GraphicsCommandList8) is forwarded in PC order, a slot past
+// it up to the end of the table (256 slots) is logged and refused with E_NOTIMPL, and a read past the table faults
+// in a guard region. Reset (slot 10) unwraps allocator proxies, SetDescriptorHeaps (slot 28) unwraps heap proxies,
+// and queue ExecuteCommandLists (slot 10) unwraps command-list proxies.
+bool is_list_proxy(const void* list);
+ID3D12GraphicsCommandList* list_proxy_real_list(const void* list);
+unsigned list_proxy_slot_count(const void* list);
+unsigned list_proxy_table_size();
+std::uint64_t list_slot_hits(unsigned slot);
+bool list_slot_first_call_seen(unsigned slot);
+std::uint64_t list_table_overruns();
 
 // Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded, a
 // slot past it up to the end of the table (64 slots) is logged and refused with E_NOTIMPL, and a read past the

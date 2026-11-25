@@ -24,6 +24,10 @@ from mc_command import mc_command  # noqa: E402
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
+SENTINEL_HEX = "0xfe 0x00 0x80 0xbf 0xff 0x00 0x80 0xbf"  # s_nop 0xfe; s_nop 0xff
+SENTINEL_ENC_1 = "[0xfe,0x00,0x80,0xbf]"
+SENTINEL_ENC_2 = "[0xff,0x00,0x80,0xbf]"
+BATCH_SIZE = 48
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
 
 
@@ -79,6 +83,38 @@ def disasm(code: bytes, mcpu: str):
     return p.stdout, bad, p.stderr
 
 
+def split_batch_output(stdout: str, count: int):
+    lines = stdout.splitlines(keepends=True)
+    chunks = []
+    start = 0
+    i = 0
+    while i < len(lines) - 1:
+        if SENTINEL_ENC_1 in lines[i] and SENTINEL_ENC_2 in lines[i + 1]:
+            chunks.append("".join(lines[start:i]))
+            i += 2
+            start = i
+            continue
+        i += 1
+    chunks.append("".join(lines[start:]))
+    if len(chunks) != count or any(not chunk.strip() for chunk in chunks):
+        return None
+    return chunks
+
+
+def disasm_batch(codes, mcpu: str):
+    """Disassemble multiple shader byte buffers in one llvm-mc call; return None to trigger per-shader fallback."""
+    text = f" {SENTINEL_HEX} ".join(" ".join(f"0x{b:02x}" for b in code) for code in codes)
+    try:
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+                           input=text, capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    except OSError:
+        return None
+    if p.returncode != 0 or p.stderr:
+        return None
+    return split_batch_output(p.stdout, len(codes))
+
+
 def code_range(b: bytes):
     """The code section offset is the u32 at 0xC0; instructions start 0x28 bytes into it and run to the last
     4-byte-aligned s_endpgm in the blob (some blobs hold several programs). Found by correlating against
@@ -97,23 +133,7 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
-def one(path, out, mcpu):
-    with open(path, "rb") as f:
-        b = f.read()
-    start, end, how = code_range(b)
-    if end is None:
-        return "no s_endpgm"
-    if start is None:
-        # Walk back in 4-byte steps from the end and keep the longest clean decode.
-        start, best = end - 4, None
-        for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-            _, bad, _ = disasm(b[s:end], mcpu)
-            if bad == 0:
-                best = s
-        if best is None:
-            return "scan failed"
-        start = best
-    asm, bad, err = disasm(b[start:end], mcpu)
+def write_listing(path, out, mcpu, start, end, how, asm, bad, err):
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
         FAILED.append((path, reason))
@@ -125,6 +145,60 @@ def one(path, out, mcpu):
         if err.strip():
             f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
     return "clean" if bad == 0 else "invalid words"
+
+
+def scan_start(b: bytes, end: int, mcpu: str):
+    # Walk back in 4-byte steps from the end and keep the longest clean decode.
+    best = None
+    for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
+        _, bad, _ = disasm(b[s:end], mcpu)
+        if bad == 0:
+            best = s
+    return best
+
+
+def one(path, out, mcpu):
+    with open(path, "rb") as f:
+        b = f.read()
+    start, end, how = code_range(b)
+    if end is None:
+        return "no s_endpgm"
+    if start is None:
+        start = scan_start(b, end, mcpu)
+        if start is None:
+            return "scan failed"
+    asm, bad, err = disasm(b[start:end], mcpu)
+    return write_listing(path, out, mcpu, start, end, how, asm, bad, err)
+
+
+def process_batch(paths, out, mcpu):
+    from collections import Counter
+    counts = Counter()
+    ready = []
+    for path in paths:
+        with open(path, "rb") as f:
+            b = f.read()
+        start, end, how = code_range(b)
+        if end is None:
+            counts["no s_endpgm"] += 1
+            continue
+        if start is None:
+            start = scan_start(b, end, mcpu)
+            if start is None:
+                counts["scan failed"] += 1
+                continue
+        ready.append((path, start, end, how, b[start:end]))
+    if not ready:
+        return counts
+    chunks = disasm_batch([item[4] for item in ready], mcpu) if len(ready) > 1 else None
+    if chunks is not None:
+        for (path, start, end, how, _), asm in zip(ready, chunks):
+            counts[write_listing(path, out, mcpu, start, end, how, asm, 0, "")] += 1
+        return counts
+    for path, start, end, how, code in ready:
+        asm, bad, err = disasm(code, mcpu)
+        counts[write_listing(path, out, mcpu, start, end, how, asm, bad, err)] += 1
+    return counts
 
 
 def main():
@@ -153,8 +227,11 @@ def main():
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
     probe(a.mcpu)
     from collections import Counter
+    batches = [files[i:i + BATCH_SIZE] for i in range(0, len(files), BATCH_SIZE)]
+    res = Counter()
     with ThreadPoolExecutor(a.jobs) as ex:
-        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
+        for counts in ex.map(lambda batch: process_batch(batch, out, a.mcpu), batches):
+            res.update(counts)
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]

@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -79,8 +81,21 @@ using PackagedProcessFn = bool(__stdcall*)();
 
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
-    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPath",
+    "XSystemGetAnalyticsInfo", "XSystemGetXboxLiveSandboxId", "XSystemGetRuntimeInfo",
+    "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPath",
     "XPackageIsPackagedProcess",
+    "XUserAddAsync", "XUserAddResult", "XUserAddByIdWithUiAsync", "XUserAddByIdWithUiResult",
+    "XUserDuplicateHandle", "XUserCloseHandle", "XUserGetId", "XUserGetLocalId", "XUserGetState",
+    "XUserGetGamertag", "XUserCompare",
+    "XGameSaveInitializeProvider", "XGameSaveInitializeProviderAsync", "XGameSaveInitializeProviderResult",
+    "XGameSaveCloseProvider", "XGameSaveGetRemainingQuota", "XGameSaveGetRemainingQuotaAsync",
+    "XGameSaveGetRemainingQuotaResult", "XGameSaveCreateContainer", "XGameSaveCloseContainer",
+    "XGameSaveDeleteContainer", "XGameSaveDeleteContainerAsync", "XGameSaveDeleteContainerResult",
+    "XGameSaveEnumerateContainerInfo", "XGameSaveEnumerateContainerInfoByName", "XGameSaveGetContainerInfo",
+    "XGameSaveEnumerateBlobInfo", "XGameSaveEnumerateBlobInfoByName",
+    "XGameSaveReadBlobData", "XGameSaveReadBlobDataAsync", "XGameSaveReadBlobDataResult",
+    "XGameSaveCreateUpdate", "XGameSaveCloseUpdate", "XGameSaveSubmitBlobWrite", "XGameSaveSubmitBlobDelete",
+    "XGameSaveSubmitUpdate", "XGameSaveSubmitUpdateAsync", "XGameSaveSubmitUpdateResult",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
     "XTaskQueueSubmitDelayedCallback", "XTaskQueueRegisterWaiter", "XTaskQueueUnregisterWaiter",
@@ -308,6 +323,284 @@ void check_run_time_load() {
     g_teardown_free_lib = free_lib;
 }
 
+void check_xsystem_extra() {
+    using SandboxIdFn = HRESULT(__stdcall*)(size_t, char*, size_t*);
+    struct XSystemRuntimeInfo {
+        XVersion runtimeVersion;
+        XVersion availableVersion;
+    };
+    using RuntimeInfoFn = HRESULT(__stdcall*)(XSystemRuntimeInfo*);
+
+    auto sandbox = get<SandboxIdFn>("XSystemGetXboxLiveSandboxId");
+    char sb[32] = {};
+    size_t used = 0;
+    check(sandbox(16, nullptr, &used) == E_INVALIDARG, "XSystemGetXboxLiveSandboxId rejects null buffer");
+    check(sandbox(3, sb, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XSystemGetXboxLiveSandboxId rejects insufficient buffer");
+    check(sandbox(sizeof(sb), sb, &used) == S_OK && std::strcmp(sb, "RETAIL") == 0 && used == 7,
+          "XSystemGetXboxLiveSandboxId returns RETAIL by default");
+    SetEnvironmentVariableA("WAVESPAN_SANDBOX_ID", "XDKS.1");
+    check(sandbox(sizeof(sb), sb, &used) == S_OK && std::strcmp(sb, "XDKS.1") == 0 && used == 7,
+          "XSystemGetXboxLiveSandboxId respects WAVESPAN_SANDBOX_ID");
+    SetEnvironmentVariableA("WAVESPAN_SANDBOX_ID", nullptr);
+
+    auto rt_info = get<RuntimeInfoFn>("XSystemGetRuntimeInfo");
+    check(rt_info(nullptr) == E_INVALIDARG, "XSystemGetRuntimeInfo rejects null pointer");
+    XSystemRuntimeInfo rti{};
+    check(rt_info(&rti) == S_OK && rti.runtimeVersion.major == 10 && rti.availableVersion.build == 22000,
+          "XSystemGetRuntimeInfo returns 10.0.22000.0");
+}
+
+void check_xuser() {
+    struct XUser;
+    using XUserHandle = XUser*;
+    enum class XUserAddOptions : uint32_t { AddDefaultUserSilently = 0x01 };
+    enum class XUserState : uint32_t { SignedIn = 0 };
+    enum class XUserGetGamertagComponent : uint32_t { Classic = 0, Modern = 1, ModernSuffix = 2, UniqueModern = 3 };
+    struct XUserLocalId { uint64_t value; };
+
+    auto add_async = get<HRESULT(__stdcall*)(XUserAddOptions, XAsyncBlock*)>("XUserAddAsync");
+    auto add_result = get<HRESULT(__stdcall*)(XAsyncBlock*, XUserHandle*)>("XUserAddResult");
+    auto add_by_id_async = get<HRESULT(__stdcall*)(uint64_t, XAsyncBlock*)>("XUserAddByIdWithUiAsync");
+    auto add_by_id_result = get<HRESULT(__stdcall*)(XAsyncBlock*, XUserHandle*)>("XUserAddByIdWithUiResult");
+    auto dup = get<HRESULT(__stdcall*)(XUserHandle, XUserHandle*)>("XUserDuplicateHandle");
+    auto close_u = get<void(__stdcall*)(XUserHandle)>("XUserCloseHandle");
+    auto get_id = get<HRESULT(__stdcall*)(XUserHandle, uint64_t*)>("XUserGetId");
+    auto get_local = get<HRESULT(__stdcall*)(XUserHandle, XUserLocalId*)>("XUserGetLocalId");
+    auto get_state = get<HRESULT(__stdcall*)(XUserHandle, XUserState*)>("XUserGetState");
+    auto get_tag = get<HRESULT(__stdcall*)(XUserHandle, XUserGetGamertagComponent, size_t, char*, size_t*)>("XUserGetGamertag");
+    auto cmp = get<int32_t(__stdcall*)(XUserHandle, XUserHandle)>("XUserCompare");
+    auto status = get<AsyncStatusFn>("XAsyncGetStatus");
+
+    XAsyncBlock ab{};
+    XUserHandle user = nullptr;
+    check(add_async(XUserAddOptions::AddDefaultUserSilently, &ab) == S_OK &&
+              status(&ab, true) == S_OK && add_result(&ab, &user) == S_OK && user != nullptr,
+          "XUserAddAsync/XUserAddResult returns an offline user handle");
+
+    uint64_t xuid = 0;
+    XUserLocalId lid{0};
+    XUserState state = static_cast<XUserState>(99);
+    char tag[64] = {};
+    size_t tag_used = 0;
+    check(get_id(user, &xuid) == S_OK && xuid != 0, "XUserGetId returns a non-zero offline XUID");
+    check(get_local(user, &lid) == S_OK && lid.value == 1, "XUserGetLocalId returns 1");
+    check(get_state(user, &state) == S_OK && state == XUserState::SignedIn, "XUserGetState reports SignedIn");
+    check(get_tag(user, XUserGetGamertagComponent::Classic, 4, tag, &tag_used) ==
+              HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XUserGetGamertag rejects insufficient buffer");
+    check(get_tag(user, XUserGetGamertagComponent::Classic, sizeof(tag), tag, &tag_used) == S_OK &&
+              std::strcmp(tag, "WaveSpanUser") == 0,
+          "XUserGetGamertag returns WaveSpanUser");
+    check(get_tag(user, XUserGetGamertagComponent::ModernSuffix, sizeof(tag), tag, &tag_used) == S_OK &&
+              tag[0] == '\0' && tag_used == 1,
+          "XUserGetGamertag ModernSuffix returns empty string");
+
+    XUserHandle dup_user = nullptr;
+    check(dup(user, &dup_user) == S_OK && dup_user == user && cmp(user, dup_user) == 0,
+          "XUserDuplicateHandle shares handle and XUserCompare returns 0");
+    close_u(dup_user);
+    close_u(user);
+    close_u(nullptr);
+
+    XAsyncBlock ab2{};
+    XUserHandle user2 = nullptr;
+    uint64_t xuid2 = 0;
+    check(add_by_id_async(0x123456789ABCDEF0ULL, &ab2) == S_OK && status(&ab2, true) == S_OK &&
+              add_by_id_result(&ab2, &user2) == S_OK && user2 != nullptr &&
+              get_id(user2, &xuid2) == S_OK && xuid2 == 0x123456789ABCDEF0ULL,
+          "XUserAddByIdWithUiAsync preserves requested XUID");
+    close_u(user2);
+}
+
+void remove_tree_best_effort(const std::string& dir) {
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (std::strcmp(fd.cFileName, ".") == 0 || std::strcmp(fd.cFileName, "..") == 0) continue;
+        std::string p = dir + "\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            remove_tree_best_effort(p);
+        } else {
+            DeleteFileA(p.c_str());
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    RemoveDirectoryA(dir.c_str());
+}
+
+void check_xgamesave() {
+    struct XGameSaveProvider;
+    struct XGameSaveContainer;
+    struct XGameSaveUpdate;
+    using ProviderH = XGameSaveProvider*;
+    using ContainerH = XGameSaveContainer*;
+    using UpdateH = XGameSaveUpdate*;
+    struct XGameSaveBlobInfo { const char* name; uint32_t size; };
+    struct XGameSaveBlob { XGameSaveBlobInfo info; uint8_t* data; };
+    struct XGameSaveContainerInfo {
+        const char* name;
+        const char* displayName;
+        uint32_t blobCount;
+        uint64_t totalSize;
+        int64_t lastModifiedTime;
+        bool needsSync;
+    };
+    using BlobInfoCb = bool(CALLBACK*)(const XGameSaveBlobInfo*, void*);
+    using ContainerInfoCb = bool(CALLBACK*)(const XGameSaveContainerInfo*, void*);
+
+    char tmp_base[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmp_base);
+    std::string save_dir = std::string(tmp_base) + "wavespan_xgs_test_" + std::to_string(GetCurrentProcessId());
+    remove_tree_best_effort(save_dir);
+    SetEnvironmentVariableA("WAVESPAN_SAVE_DIR", save_dir.c_str());
+
+    auto init_sync = get<HRESULT(__stdcall*)(void*, const char*, bool, ProviderH*)>("XGameSaveInitializeProvider");
+    auto init_async = get<HRESULT(__stdcall*)(void*, const char*, bool, XAsyncBlock*)>("XGameSaveInitializeProviderAsync");
+    auto init_res = get<HRESULT(__stdcall*)(XAsyncBlock*, ProviderH*)>("XGameSaveInitializeProviderResult");
+    auto close_prov = get<void(__stdcall*)(ProviderH)>("XGameSaveCloseProvider");
+    auto quota_sync = get<HRESULT(__stdcall*)(ProviderH, int64_t*)>("XGameSaveGetRemainingQuota");
+    auto quota_async = get<HRESULT(__stdcall*)(ProviderH, XAsyncBlock*)>("XGameSaveGetRemainingQuotaAsync");
+    auto quota_res = get<HRESULT(__stdcall*)(XAsyncBlock*, int64_t*)>("XGameSaveGetRemainingQuotaResult");
+    auto create_cont = get<HRESULT(__stdcall*)(ProviderH, const char*, ContainerH*)>("XGameSaveCreateContainer");
+    auto close_cont = get<void(__stdcall*)(ContainerH)>("XGameSaveCloseContainer");
+    auto del_cont = get<HRESULT(__stdcall*)(ProviderH, const char*)>("XGameSaveDeleteContainer");
+    auto enum_cont = get<HRESULT(__stdcall*)(ProviderH, void*, ContainerInfoCb)>("XGameSaveEnumerateContainerInfo");
+    auto get_cont = get<HRESULT(__stdcall*)(ProviderH, const char*, void*, ContainerInfoCb)>("XGameSaveGetContainerInfo");
+    auto enum_blob = get<HRESULT(__stdcall*)(ContainerH, void*, BlobInfoCb)>("XGameSaveEnumerateBlobInfo");
+    auto read_sync = get<HRESULT(__stdcall*)(ContainerH, const char**, uint32_t*, size_t, XGameSaveBlob*)>("XGameSaveReadBlobData");
+    auto read_async = get<HRESULT(__stdcall*)(ContainerH, const char**, uint32_t, XAsyncBlock*)>("XGameSaveReadBlobDataAsync");
+    auto read_res = get<HRESULT(__stdcall*)(XAsyncBlock*, size_t, XGameSaveBlob*, uint32_t*)>("XGameSaveReadBlobDataResult");
+    auto create_upd = get<HRESULT(__stdcall*)(ContainerH, const char*, UpdateH*)>("XGameSaveCreateUpdate");
+    auto close_upd = get<void(__stdcall*)(UpdateH)>("XGameSaveCloseUpdate");
+    auto sub_write = get<HRESULT(__stdcall*)(UpdateH, const char*, const uint8_t*, size_t)>("XGameSaveSubmitBlobWrite");
+    auto sub_del = get<HRESULT(__stdcall*)(UpdateH, const char*)>("XGameSaveSubmitBlobDelete");
+    auto sub_upd = get<HRESULT(__stdcall*)(UpdateH)>("XGameSaveSubmitUpdate");
+    auto sub_upd_async = get<HRESULT(__stdcall*)(UpdateH, XAsyncBlock*)>("XGameSaveSubmitUpdateAsync");
+    auto sub_upd_res = get<HRESULT(__stdcall*)(XAsyncBlock*)>("XGameSaveSubmitUpdateResult");
+    auto status = get<AsyncStatusFn>("XAsyncGetStatus");
+    auto result_size = get<AsyncResultSizeFn>("XAsyncGetResultSize");
+
+    ProviderH prov = nullptr;
+    check(init_sync(nullptr, "cfg", false, &prov) == S_OK && prov != nullptr,
+          "XGameSaveInitializeProvider succeeds offline");
+    int64_t quota = 0;
+    check(quota_sync(prov, &quota) == S_OK && quota > 0, "XGameSaveGetRemainingQuota returns positive offline quota");
+
+    XAsyncBlock q_ab{};
+    int64_t quota2 = 0;
+    check(quota_async(prov, &q_ab) == S_OK && status(&q_ab, true) == S_OK &&
+              quota_res(&q_ab, &quota2) == S_OK && quota2 == quota,
+          "XGameSaveGetRemainingQuotaAsync matches sync quota");
+
+    ContainerH cont = nullptr;
+    check(create_cont(prov, "slot 1", &cont) == S_OK && cont != nullptr,
+          "XGameSaveCreateContainer creates handle for container with space");
+
+    UpdateH upd = nullptr;
+    const uint8_t payload_a[] = {0x4A, 0x53, 0x41, 0x56, 0x03};
+    const uint8_t payload_b[] = {1, 2, 3, 4, 5, 6};
+    check(create_upd(cont, "Slot 1", &upd) == S_OK && upd != nullptr, "XGameSaveCreateUpdate succeeds");
+    check(sub_write(upd, "main.sav", payload_a, sizeof(payload_a)) == S_OK, "XGameSaveSubmitBlobWrite queues blob");
+    check(sub_write(upd, ".hidden", payload_b, sizeof(payload_b)) == S_OK,
+          "XGameSaveSubmitBlobWrite queues dot-prefixed blob");
+    check(sub_upd(upd) == S_OK, "XGameSaveSubmitUpdate writes blobs to disk");
+    check(sub_upd(upd) == static_cast<HRESULT>(0x8083000B), "resubmitting an update returns E_GS_HANDLE_EXPIRED");
+    close_upd(upd);
+
+    // Verify %-encoding on disk matches tools/saves.py (space -> %20, leading dot -> %2E).
+    DWORD attr = GetFileAttributesA((save_dir + "\\local-user\\slot%201\\%2Ehidden").c_str());
+    check(attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY),
+          "XGameSave encodes container and blob names with tools/saves.py %-encoding");
+
+    // Enumerate containers and blobs.
+    struct SeenCont { std::string name; uint32_t count; uint64_t size; };
+    std::vector<SeenCont> conts;
+    check(enum_cont(prov, &conts, [](const XGameSaveContainerInfo* info, void* ctx) {
+        static_cast<std::vector<SeenCont>*>(ctx)->push_back({info->name, info->blobCount, info->totalSize});
+        return true;
+    }) == S_OK && conts.size() == 1 && conts[0].name == "slot 1" && conts[0].count == 2 && conts[0].size == 11,
+          "XGameSaveEnumerateContainerInfo decodes name and reports blobCount=2, totalSize=11");
+
+    std::vector<SeenCont> one_cont;
+    check(get_cont(prov, "slot 1", &one_cont, [](const XGameSaveContainerInfo* info, void* ctx) {
+        static_cast<std::vector<SeenCont>*>(ctx)->push_back({info->name, info->blobCount, info->totalSize});
+        return true;
+    }) == S_OK && one_cont.size() == 1 && one_cont[0].name == "slot 1",
+          "XGameSaveGetContainerInfo finds exact container");
+
+    std::vector<std::string> blob_names;
+    check(enum_blob(cont, &blob_names, [](const XGameSaveBlobInfo* info, void* ctx) {
+        static_cast<std::vector<std::string>*>(ctx)->emplace_back(info->name);
+        return true;
+    }) == S_OK && blob_names.size() == 2,
+          "XGameSaveEnumerateBlobInfo finds both blobs");
+
+    // Read sync + buffer-too-small + missing blob.
+    const char* req[] = {"main.sav", ".hidden"};
+    uint32_t req_count = 2;
+    std::vector<uint8_t> buf(256);
+    check(read_sync(cont, req, &req_count, 4, reinterpret_cast<XGameSaveBlob*>(buf.data())) ==
+              static_cast<HRESULT>(0x80830007),
+          "XGameSaveReadBlobData returns E_GS_PROVIDED_BUFFER_TOO_SMALL when buffer is too small");
+    const char* missing_req[] = {"no_such_blob"};
+    uint32_t missing_count = 1;
+    check(read_sync(cont, missing_req, &missing_count, buf.size(), reinterpret_cast<XGameSaveBlob*>(buf.data())) ==
+              static_cast<HRESULT>(0x80830008),
+          "XGameSaveReadBlobData returns E_GS_BLOB_NOT_FOUND for missing blob");
+    check(read_sync(cont, req, &req_count, buf.size(), reinterpret_cast<XGameSaveBlob*>(buf.data())) == S_OK,
+          "XGameSaveReadBlobData reads both blobs");
+    auto* out_blobs = reinterpret_cast<XGameSaveBlob*>(buf.data());
+    check(std::strcmp(out_blobs[0].info.name, "main.sav") == 0 && out_blobs[0].info.size == sizeof(payload_a) &&
+              std::memcmp(out_blobs[0].data, payload_a, sizeof(payload_a)) == 0 &&
+              std::strcmp(out_blobs[1].info.name, ".hidden") == 0 && out_blobs[1].info.size == sizeof(payload_b) &&
+              std::memcmp(out_blobs[1].data, payload_b, sizeof(payload_b)) == 0,
+          "XGameSaveReadBlobData returns byte-identical payloads");
+
+    // Read async.
+    XAsyncBlock r_ab{};
+    size_t need = 0;
+    check(read_async(cont, req, 2, &r_ab) == S_OK && status(&r_ab, true) == S_OK &&
+              result_size(&r_ab, &need) == S_OK && need > sizeof(XGameSaveBlob) * 2,
+          "XGameSaveReadBlobDataAsync completes and reports required buffer size");
+    std::vector<uint8_t> abuf(need);
+    uint32_t got_count = 0;
+    check(read_res(&r_ab, abuf.size(), reinterpret_cast<XGameSaveBlob*>(abuf.data()), &got_count) == S_OK &&
+              got_count == 2 &&
+              std::memcmp(reinterpret_cast<XGameSaveBlob*>(abuf.data())[0].data, payload_a, sizeof(payload_a)) == 0,
+          "XGameSaveReadBlobDataResult unpacks blobs and countOfBlobs");
+
+    // Delete blob via async update.
+    UpdateH upd2 = nullptr;
+    XAsyncBlock u_ab{};
+    check(create_upd(cont, nullptr, &upd2) == S_OK && sub_del(upd2, ".hidden") == S_OK &&
+              sub_upd_async(upd2, &u_ab) == S_OK && status(&u_ab, true) == S_OK && sub_upd_res(&u_ab) == S_OK,
+          "XGameSaveSubmitBlobDelete + XGameSaveSubmitUpdateAsync removes blob");
+    close_upd(upd2);
+    check(read_sync(cont, req, &req_count, buf.size(), reinterpret_cast<XGameSaveBlob*>(buf.data())) ==
+              static_cast<HRESULT>(0x80830008),
+          "deleted blob is no longer readable");
+
+    close_cont(cont);
+    check(del_cont(prov, "slot 1") == S_OK, "XGameSaveDeleteContainer succeeds");
+    conts.clear();
+    check(enum_cont(prov, &conts, [](const XGameSaveContainerInfo*, void*) { return true; }) == S_OK && conts.empty(),
+          "deleted container is no longer enumerated");
+    close_prov(prov);
+
+    // Async provider init.
+    XAsyncBlock p_ab{};
+    ProviderH prov2 = nullptr;
+    check(init_async(nullptr, nullptr, false, &p_ab) == S_OK && status(&p_ab, true) == S_OK &&
+              init_res(&p_ab, &prov2) == S_OK && prov2 != nullptr,
+          "XGameSaveInitializeProviderAsync/Result succeeds");
+    close_prov(prov2);
+
+    SetEnvironmentVariableA("WAVESPAN_SAVE_DIR", nullptr);
+    remove_tree_best_effort(save_dir);
+}
+
 }  // namespace
 
 int main() {
@@ -455,6 +748,9 @@ int main() {
 
     std::atexit(check_late_teardown);
     check_run_time_load();
+    check_xsystem_extra();
+    check_xuser();
+    check_xgamesave();
 
     if (g_failures) {
         std::printf("xgameruntime_test: %d of %d checks failed\n", g_failures, g_checks);

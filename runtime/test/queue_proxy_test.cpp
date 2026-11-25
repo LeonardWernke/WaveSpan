@@ -252,7 +252,7 @@ int check_slots(const Backend& b) {
             }
         }
 
-        // 10: ExecuteCommandLists passes the (real, not wrapped) command lists through.
+        // 10: ExecuteCommandLists unwraps the command-list proxies before forwarding.
         {
             Ref<ID3D12CommandAllocator> allocator;
             EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -260,7 +260,42 @@ int check_slots(const Backend& b) {
             Ref<ID3D12GraphicsCommandList> list;
             EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                        IID_PPV_ARGS(&list.p))));
+            EXPECT(xs::device_slot_hits(12) >= 1 && xs::is_list_proxy(list.p));
+            ID3D12GraphicsCommandList* real_list = xs::list_proxy_real_list(list.p);
+            EXPECT(real_list && static_cast<void*>(real_list) != static_cast<void*>(list.p));
+            const unsigned list_slots = xs::list_proxy_slot_count(list.p);
+            EXPECT(list_slots >= 60 && xs::list_proxy_table_size() == 256);
+            EXPECT(xs::command_object_proxy_ref_count(list.p) == 1);
+            {
+                Ref<ID3D12Device> owner;
+                EXPECT(SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&owner.p))) && owner.p == device);
+                Ref<ID3D12Pageable> pageable;
+                EXPECT(list->QueryInterface(IID_PPV_ARGS(&pageable.p)) == E_NOINTERFACE && !pageable.p);
+            }
+            // SetDescriptorHeaps (slot 28) unwraps heap proxies.
+            {
+                D3D12_DESCRIPTOR_HEAP_DESC hdesc{};
+                hdesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                hdesc.NumDescriptors = 1;
+                hdesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                Ref<ID3D12DescriptorHeap> heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&hdesc, IID_PPV_ARGS(&heap.p))));
+                EXPECT(xs::is_heap_proxy(heap.p));
+                ID3D12DescriptorHeap* heaps[] = {heap.p};
+                const std::uint64_t lbefore = xs::list_slot_hits(28);
+                list->SetDescriptorHeaps(1, heaps);
+                EXPECT(xs::list_slot_hits(28) == lbefore + 1);
+            }
             EXPECT(SUCCEEDED(list->Close()));
+            // Reset (slot 10) unwraps allocator proxies.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            EXPECT(SUCCEEDED(list->Close()));
+            // Refused tail on the command-list proxy.
+            for (unsigned slot = list_slots; slot < xs::list_proxy_table_size(); ++slot) {
+                const std::uint64_t lbefore = xs::list_slot_hits(slot);
+                EXPECT(as_hr(call_slot(list.p, slot)) == E_NOTIMPL);
+                EXPECT(xs::list_slot_hits(slot) == lbefore + 1 && xs::list_slot_first_call_seen(slot));
+            }
             ID3D12CommandList* lists[] = {list.p};
             before = qhits(10);
             queue->ExecuteCommandLists(1, lists);
@@ -271,6 +306,14 @@ int check_slots(const Backend& b) {
                 // The layer's own helpers find their queue behind the proxy.
                 EXPECT(rt::d3d12::last_execute_result(queue.p) == wavespan::ReplayResult::success);
                 (void)rt::d3d12::queue_uses_calibrated_timestamps(queue.p);
+            }
+            // Device slot 51 (ID3D12Device4::CreateCommandList1) also wraps its list.
+            Ref<ID3D12Device4> device4;
+            if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) {
+                Ref<ID3D12GraphicsCommandList> list1;
+                EXPECT(SUCCEEDED(device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                             D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&list1.p))));
+                EXPECT(xs::device_slot_hits(51) >= 1 && xs::is_list_proxy(list1.p));
             }
         }
 
@@ -413,14 +456,21 @@ int check_guard(const Backend& b) {
     D3D12_COMMAND_QUEUE_DESC desc{};
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12Fence> fence;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
     EXPECT(SUCCEEDED(b.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
     EXPECT(SUCCEEDED(b.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(b.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(b.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->Close()));
     struct Probe {
         void* object;
         unsigned table;
         std::uint64_t (*overruns)();
     } probes[] = {{queue.p, xs::queue_proxy_table_size(), &xs::queue_table_overruns},
-                  {fence.p, xs::fence_proxy_table_size(), &xs::fence_table_overruns}};
+                  {fence.p, xs::fence_proxy_table_size(), &xs::fence_table_overruns},
+                  {list.p, xs::list_proxy_table_size(), &xs::list_table_overruns}};
     for (const Probe& probe : probes) {
         void* const* vtable = *reinterpret_cast<void* const* const*>(probe.object);
         EXPECT(read_slot_guarded(vtable, probe.table - 1) == 0);  // the last table slot is readable
@@ -1456,8 +1506,8 @@ int check_coverage(const Backend& b) {
     }
     for (unsigned slot = 0; slot < xs::fence_proxy_table_size(); ++slot) need("fence", slot, xs::fence_slot_hits(slot));
     EXPECT(missing == 0);
-    EXPECT(xs::queue_table_overruns() >= 3 && xs::fence_table_overruns() >= 3);
-    std::printf("%s: coverage: device slots 8/34/35/36/45/46/50%s%s%s, %s %u queue and all %u fence slots, both "
+    EXPECT(xs::queue_table_overruns() >= 3 && xs::fence_table_overruns() >= 3 && xs::list_table_overruns() >= 3);
+    std::printf("%s: coverage: device slots 8/34/35/36/45/46/50%s%s%s, %s %u queue, all %u fence and list "
                 "guard regions\n", label, device9 ? "/75" : "", g_shared_created ? "/31" : "",
                 g_shared_checked ? "/32" : "", g_reserved_checked ? "all" : "all but 8/9 of the",
                 xs::queue_proxy_table_size(), xs::fence_proxy_table_size());

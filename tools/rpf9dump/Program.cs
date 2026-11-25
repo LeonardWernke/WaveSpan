@@ -11,7 +11,7 @@ var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
 long length = new FileInfo(src).Length;
-int ok = 0, fail = 0, skip = 0;
+int ok = 0, fail = 0, skip = 0, unexpectedFail = 0;
 // Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
 // come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
 // ponytail: every core, no flag; add --jobs if someone needs the machine during a build.
@@ -178,6 +178,8 @@ else if (mode is "models" or "textures")
                 if (count <= 3)
                     Console.Error.WriteLine($"  model decode failed at 0x{list[start + i].Offset:X}: {reason.Code} ({reason.Detail})");
             }
+            else
+                unexpectedFail += r.Fail;
             if (r.Error != null && fail <= 5) Console.WriteLine(r.Error);
             if (r.Row != null) Row(r.Row);
         }
@@ -246,10 +248,16 @@ else if (mode is "models" or "textures")
     writer.WriteEndObject();
     writer.Dispose();          // flushes; the later using-dispose is a no-op
     mstream.Dispose();
-    File.Move(partial, manifestPath, true);
+    if (unexpectedFail == 0)
+        File.Move(partial, manifestPath, true);
+    else
+    {
+        File.Delete(partial);
+        File.Delete(manifestPath);
+    }
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
-return mode == "ttpf" && fail != 0 ? 1 : 0;
+return (mode == "ttpf" && fail != 0) || unexpectedFail != 0 ? 1 : 0;
 
 // One exported entry: its manifest row (null when nothing was written), counts, and a failure to report in order.
 readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error);

@@ -5022,6 +5022,25 @@ int main() {
                                                           nullptr, IID_PPV_ARGS(&placed_a.p))));
         EXPECT(placed_a->GetGPUVirtualAddress() == placed_va);
 
+        // Releasing the ID3D12Heap while a placed resource is still alive must not free the heap's arena range.
+        again.reset();
+        Ref<ID3D12Heap> next_heap;
+        Ref<ID3D12Resource> next_buf;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&next_heap.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(next_heap.p, 0, &placed_buffer,
+                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                          IID_PPV_ARGS(&next_buf.p))));
+        EXPECT(next_buf->GetGPUVirtualAddress() != placed_va);
+        // Once the placed resource is released too, the arena range is returned and reusable.
+        placed_a.reset();
+        Ref<ID3D12Heap> reused_heap;
+        Ref<ID3D12Resource> reused_buf;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&reused_heap.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(reused_heap.p, 0, &placed_buffer,
+                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                          IID_PPV_ARGS(&reused_buf.p))));
+        EXPECT(reused_buf->GetGPUVirtualAddress() == placed_va);
+
         // D3D-191: tiled placed resources (D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE and Xbox 0x101).
         D3D12_HEAP_DESC tiled_heap_desc{};
         tiled_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -5032,6 +5051,147 @@ int main() {
         D3D12_HEAP_DESC upload_heap_desc = tiled_heap_desc;
         upload_heap_desc.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
         EXPECT(SUCCEEDED(standalone->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p))));
+
+        // Sparse reserved resources + UpdateTileMappings (vkQueueBindSparse) on standalone device:
+        // tests buffer tile mapping, aliasing, NULL unmapping, and 2D standard-tile sparse mapping.
+        {
+            const auto B = D3D12_RESOURCE_DIMENSION_BUFFER, T2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            Ref<ID3D12CommandQueue> sq;
+            Ref<ID3D12CommandAllocator> sa;
+            Ref<ID3D12GraphicsCommandList> sl;
+            Ref<ID3D12Fence> sf;
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            EXPECT(SUCCEEDED(standalone->CreateCommandQueue(&qd, IID_PPV_ARGS(&sq.p))));
+            EXPECT(SUCCEEDED(standalone->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&sa.p))));
+            EXPECT(SUCCEEDED(standalone->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sa.p, nullptr,
+                                                          IID_PPV_ARGS(&sl.p))));
+            EXPECT(SUCCEEDED(standalone->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&sf.p))));
+            EXPECT(SUCCEEDED(sl->Close()));
+            HANDLE sf_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(sf_event != nullptr);
+            UINT64 sf_val = 0;
+            const auto sync_sq = [&] {
+                ++sf_val;
+                if (FAILED(sq->Signal(sf.p, sf_val)) || FAILED(sf->SetEventOnCompletion(sf_val, sf_event))) return false;
+                return WaitForSingleObject(sf_event, 5000) == WAIT_OBJECT_0;
+            };
+
+            Ref<ID3D12Resource> up_buf, down_buf, res_buf, alias_buf, sparse_2d;
+            const D3D12_HEAP_PROPERTIES up_hp{D3D12_HEAP_TYPE_UPLOAD};
+            const D3D12_HEAP_PROPERTIES down_hp{D3D12_HEAP_TYPE_READBACK};
+            const D3D12_RESOURCE_DESC up_desc = buffer_desc(65536);
+            EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &up_desc,
+                                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                                 IID_PPV_ARGS(&up_buf.p))));
+            EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&down_hp, D3D12_HEAP_FLAG_NONE, &up_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&down_buf.p))));
+            std::uint8_t* sup = nullptr;
+            std::uint8_t* sdown = nullptr;
+            EXPECT(SUCCEEDED(up_buf->Map(0, nullptr, reinterpret_cast<void**>(&sup))));
+            EXPECT(SUCCEEDED(down_buf->Map(0, nullptr, reinterpret_cast<void**>(&sdown))));
+            for (UINT i = 0; i < 256; ++i) sup[i] = std::uint8_t(0x5a ^ i);
+
+            const D3D12_RESOURCE_DESC buf_rdesc = reserved_desc(B, 2 * 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            const D3D12_RESOURCE_DESC alias_rdesc = reserved_desc(B, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            const D3D12_RESOURCE_DESC tex_rdesc = reserved_desc(T2, 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+            EXPECT(SUCCEEDED(standalone->CreateReservedResource(&buf_rdesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                IID_PPV_ARGS(&res_buf.p))));
+            EXPECT(SUCCEEDED(standalone->CreateReservedResource(&alias_rdesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                IID_PPV_ARGS(&alias_buf.p))));
+            EXPECT(SUCCEEDED(standalone->CreateReservedResource(&tex_rdesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                IID_PPV_ARGS(&sparse_2d.p))));
+
+            const D3D12_TILED_RESOURCE_COORDINATE origin{};
+            const D3D12_TILED_RESOURCE_COORDINATE buf_tile1{1, 0, 0, 0};
+            const D3D12_TILED_RESOURCE_COORDINATE tex_tile10{1, 0, 0, 0};
+            const D3D12_TILE_REGION_SIZE one_tile{1, FALSE, 0, 0, 0};
+            const D3D12_TILE_RANGE_FLAGS map_flag = D3D12_TILE_RANGE_FLAG_NONE;
+            const D3D12_TILE_RANGE_FLAGS unmap_flag = D3D12_TILE_RANGE_FLAG_NULL;
+            const UINT one_count = 1;
+            const UINT heap_tile0 = 0, heap_tile1 = 1;
+            sq->UpdateTileMappings(res_buf.p, 1, &buf_tile1, &one_tile, tiled_heap.p, 1, &map_flag, &heap_tile0,
+                                   &one_count, D3D12_TILE_MAPPING_FLAG_NONE);
+            sq->UpdateTileMappings(alias_buf.p, 1, &origin, &one_tile, tiled_heap.p, 1, &map_flag, &heap_tile0,
+                                   &one_count, D3D12_TILE_MAPPING_FLAG_NONE);
+            sq->UpdateTileMappings(sparse_2d.p, 1, &tex_tile10, &one_tile, tiled_heap.p, 1, &map_flag, &heap_tile1,
+                                   &one_count, D3D12_TILE_MAPPING_FLAG_NONE);
+
+            const D3D12_RESOURCE_DESC patch_desc =
+                texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 1);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT patch_fp{};
+            standalone->GetCopyableFootprints(&patch_desc, 0, 1, 512, &patch_fp, nullptr, nullptr, nullptr);
+            for (UINT row = 0; row < 16; ++row)
+                for (UINT col = 0; col < 16; ++col) {
+                    const std::uint8_t px[4] = {std::uint8_t(col + 10), std::uint8_t(row + 20), 0x33, 0xff};
+                    std::memcpy(sup + patch_fp.Offset + row * patch_fp.Footprint.RowPitch + col * 4, px, 4);
+                }
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT down_mapped_fp = patch_fp;
+            down_mapped_fp.Offset = 512;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT down_unmapped_fp = patch_fp;
+            down_unmapped_fp.Offset = 8192;
+            std::memset(sdown, 0xcd, 65536);
+
+            EXPECT(SUCCEEDED(sa->Reset()) && SUCCEEDED(sl->Reset(sa.p, nullptr)));
+            sl->CopyBufferRegion(res_buf.p, 65536 + 4096, up_buf.p, 0, 256);
+            {
+                const auto dst = subresource(sparse_2d.p, 0);
+                const auto src = footprint(up_buf.p, patch_fp);
+                sl->CopyTextureRegion(&dst, 128, 0, 0, &src, nullptr);
+                D3D12_RESOURCE_BARRIER b = transition(sparse_2d.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+                sl->ResourceBarrier(1, &b);
+                const auto rdst1 = footprint(down_buf.p, down_mapped_fp);
+                const auto rsrc = subresource(sparse_2d.p, 0);
+                const D3D12_BOX mapped_box{128, 0, 0, 144, 16, 1};
+                sl->CopyTextureRegion(&rdst1, 0, 0, 0, &rsrc, &mapped_box);
+                const auto rdst0 = footprint(down_buf.p, down_unmapped_fp);
+                const D3D12_BOX unmapped_box{0, 0, 0, 16, 16, 1};
+                sl->CopyTextureRegion(&rdst0, 0, 0, 0, &rsrc, &unmapped_box);
+            }
+            EXPECT(sl->Close() == S_OK);
+            ID3D12CommandList* slists[] = {sl.p};
+            sq->ExecuteCommandLists(1, slists);
+            EXPECT(rt::d3d12::last_execute_result(sq.p) == wavespan::ReplayResult::success);
+            EXPECT(sync_sq());
+
+            // Read aliased buffer tile 0 in a fresh submission (separate VkBuffer aliasing the same VkDeviceMemory).
+            EXPECT(SUCCEEDED(sa->Reset()) && SUCCEEDED(sl->Reset(sa.p, nullptr)));
+            sl->CopyBufferRegion(down_buf.p, 0, alias_buf.p, 4096, 256);
+            EXPECT(sl->Close() == S_OK);
+            sq->ExecuteCommandLists(1, slists);
+            EXPECT(rt::d3d12::last_execute_result(sq.p) == wavespan::ReplayResult::success);
+            EXPECT(sync_sq());
+            EXPECT(std::memcmp(sdown, sup, 256) == 0);  // aliased buffer reads what res_buf wrote
+            for (UINT row = 0; row < 16; ++row)
+                for (UINT col = 0; col < 16; ++col) {
+                    const std::uint8_t expected[4] = {std::uint8_t(col + 10), std::uint8_t(row + 20), 0x33, 0xff};
+                    const std::uint8_t zeros4[4]{};
+                    EXPECT(std::memcmp(sdown + down_mapped_fp.Offset + row * down_mapped_fp.Footprint.RowPitch + col * 4,
+                                       expected, 4) == 0);
+                    EXPECT(std::memcmp(
+                               sdown + down_unmapped_fp.Offset + row * down_unmapped_fp.Footprint.RowPitch + col * 4,
+                               zeros4, 4) == 0);
+                }
+
+            // Unmap alias_buf tile 0 with NULL and verify it reads zero while res_buf tile 1 keeps its data.
+            sq->UpdateTileMappings(alias_buf.p, 1, &origin, &one_tile, nullptr, 1, &unmap_flag, nullptr, nullptr,
+                                   D3D12_TILE_MAPPING_FLAG_NONE);
+            std::memset(sdown, 0xcd, 512);
+            EXPECT(SUCCEEDED(sa->Reset()) && SUCCEEDED(sl->Reset(sa.p, nullptr)));
+            sl->CopyBufferRegion(down_buf.p, 0, alias_buf.p, 4096, 256);
+            sl->CopyBufferRegion(down_buf.p, 256, res_buf.p, 65536 + 4096, 256);
+            EXPECT(sl->Close() == S_OK);
+            sq->ExecuteCommandLists(1, slists);
+            EXPECT(rt::d3d12::last_execute_result(sq.p) == wavespan::ReplayResult::success);
+            EXPECT(sync_sq());
+            std::uint8_t zeros256[256]{};
+            EXPECT(std::memcmp(sdown, zeros256, 256) == 0);
+            EXPECT(std::memcmp(sdown + 256, sup, 256) == 0);
+            CloseHandle(sf_event);
+        }
 
         // D3D-238: heap descriptions the host refuses (RX 5700 and WARP), from CreateHeap and CreateHeap1 alike, and
         // their valid neighbours. compare_invalid_arguments and compare_heap_neighbours check them against a host.

@@ -1075,12 +1075,16 @@ public:
     // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
     // emulated: every tile keeps its own memory. What that loses is reported once each: two resources mapped to the
     // same heap tiles do not alias, and a tile unmapped (or remapped) keeps its contents.
-    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
-                                              const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
-                                              const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
-                                              D3D12_TILE_MAPPING_FLAGS) override {
-        d3d12_trace::record("ID3D12CommandQueue::UpdateTileMappings", "ignored");
-        note_once("ID3D12CommandQueue::UpdateTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* resource, UINT num_regions,
+                                              const D3D12_TILED_RESOURCE_COORDINATE* region_starts,
+                                              const D3D12_TILE_REGION_SIZE* region_sizes, ID3D12Heap* heap,
+                                              UINT num_ranges, const D3D12_TILE_RANGE_FLAGS* range_flags,
+                                              const UINT* heap_range_offsets, const UINT* range_tile_counts,
+                                              D3D12_TILE_MAPPING_FLAGS flags) override {
+        d3d12_trace::record("ID3D12CommandQueue::UpdateTileMappings");
+        std::lock_guard lock(mutex_);
+        update_tile_mappings(context_, vk_queue_, resource, num_regions, region_starts, region_sizes, heap,
+                             num_ranges, range_flags, heap_range_offsets, range_tile_counts, flags);
     }
 
     void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,

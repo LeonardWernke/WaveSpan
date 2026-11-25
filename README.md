@@ -21,7 +21,7 @@ The build runs on your PC.
 > readable on disk. WaveSpan reads files as supplied and includes no decryption tools or keys. Keep game files,
 > generated shaders, extracted assets, and saves on your PC.
 
-![WaveSpan desktop launcher showing package selection, build folders, and activity](docs/wavespan-launcher.png)
+![Python launcher showing package selection, build folders, and activity](docs/wavespan-launcher.png)
 
 ## Tested games
 
@@ -47,7 +47,7 @@ The build runs on your PC.
    git submodule update --init --recursive
    ```
 
-3. Double-click `Build.bat` to open WaveSpan.
+3. Double-click `Build.bat` to open WaveSpan. It opens the Windows EXE when built and uses the Python launcher otherwise.
 4. Select the folder containing `MicrosoftGame.Config` and the readable `.rpf` archives. Choose **Check package**
    to validate it or **Build workspace** to start the build. Watch progress in **Build activity**.
 
@@ -59,8 +59,10 @@ Choose a separate work folder if another drive has more free space.
 
 - **Your own copy** of the Xbox Series package, version 1.0.2.1.
 - **Windows 10/11 x64**, with about **350 GB** free for work files. They can go on another drive with `--work`.
+- Git for Windows is required to initialize the archive-reader submodule.
 - [Python 3.12+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+- **Asset export:** .NET SDK 8 or newer on PATH to build the .NET 8 archive tool, plus the .NET 8 runtime to run it. The .NET 8 SDK includes that runtime. [Download .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
+- **Windows launcher:** use the .NET 10 SDK to publish it. Running the published EXE requires the x64 .NET 10 Desktop Runtime and WebView2. [Download .NET 10](https://dotnet.microsoft.com/download/dotnet/10.0) · [Download WebView2](https://developer.microsoft.com/microsoft-edge/webview2/).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
   Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
@@ -70,6 +72,19 @@ Choose a separate work folder if another drive has more free space.
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
+
+### Build the optional Windows launcher EXE
+
+From the repository root, use the .NET 10 SDK:
+
+```powershell
+dotnet publish tools/WaveSpanLauncher/WaveSpanLauncher.csproj -c Release -r win-x64 --self-contained false
+```
+
+Open `WaveSpanLauncher.exe` in `tools/WaveSpanLauncher/bin/Release/net10.0-windows/win-x64/publish/` directly,
+or double-click `Build.bat`. Direct launch needs the adjacent `wwwroot` directory, the WaveSpan checkout,
+Python 3.12+, the .NET 10 Desktop Runtime, and the Microsoft Edge WebView2 Runtime. The EXE calls the same
+`make_game.py` builder. WebView2 saves its profile under `%LOCALAPPDATA%\WaveSpan\WebView2`.
 
 ### Build from a terminal
 

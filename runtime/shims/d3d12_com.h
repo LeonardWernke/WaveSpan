@@ -127,6 +127,7 @@ struct VulkanDeviceInfo {
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    VkDeviceSize host_import_alignment = 0;  // Nonzero when VK_EXT_external_memory_host was enabled.
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
@@ -156,6 +157,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device.
 void set_device_outer(ID3D12Device* device, IUnknown* outer);
+
+// The caller owns the committed writable address range and keeps it live until GPU work and the resource end.
+HRESULT create_vulkan_host_buffer(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                  REFIID riid, void** out);
+// S_FALSE means no matching imported backing was found and the ordinary heap path should be used.
+HRESULT create_vulkan_host_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                           REFIID riid, void** out);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);

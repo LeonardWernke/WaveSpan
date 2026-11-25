@@ -109,58 +109,111 @@ void __stdcall XMemFreeDefault(void* p) {
 }
 
 // XMemVirtualAlloc: Xbox variant of VirtualAlloc that accepts an attribute word for the memory type.
-// The attribute word is not decoded (the type/pool fields are console-only); forward to VirtualAlloc with
-// the PC-compatible MEM_* and PAGE_* flags the caller passes.
-// ASSUMPTION: `type` and `protect` are MEM_RESERVE|MEM_COMMIT and PAGE_READWRITE (measured at the game's
-// static-init call site in amd_fidelityfx_upscaler_xbox.dll). The `attributes` word is ignored here as
-// it is in XMemAlloc.
-void* __stdcall XMemVirtualAlloc(size_t size, DWORD type, DWORD protect, uint64_t /*attributes*/) {
+// Measured at game_scarlett_master.exe: 5 arguments (address, size, type, protect, attributes).
+// Mask `type` to PC-supported allocation flags so console-only flags like MEM_LARGE_PAGES (0x20000000) and
+// 0x00400000 don't cause VirtualAlloc to fail; `attributes` is ignored.
+void* __stdcall XMemVirtualAlloc(void* address, size_t size, DWORD type, DWORD protect, uint64_t /*attributes*/) {
+    constexpr DWORD kPcAllocFlags =
+        MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_RESET | MEM_RESET_UNDO | MEM_WRITE_WATCH;
+    constexpr DWORD kPlaceholderFlags = MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+    const DWORD pc_type = type & (kPcAllocFlags | kPlaceholderFlags);
+    if (pc_type & kPlaceholderFlags) {
+        // A regular reservation cannot be split by VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER).
+        static const auto alloc2 = reinterpret_cast<decltype(&VirtualAlloc2)>(
+            GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "VirtualAlloc2"));
+        if (!alloc2) {
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+            return nullptr;
+        }
+        const DWORD page_protection = (pc_type & MEM_COMMIT) ? protect : PAGE_NOACCESS;
+        void* allocation = alloc2(GetCurrentProcess(), address, size, pc_type, page_protection, nullptr, 0);
+        if (!allocation && (pc_type & MEM_COMMIT) && GetLastError() == ERROR_INVALID_PARAMETER)
+            allocation = alloc2(GetCurrentProcess(), address, size, pc_type, PAGE_READWRITE, nullptr, 0);
+        return allocation;
+    }
     static std::atomic<bool> logged{false};
-    if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc(size=%zu, type=0x%lx, protect=0x%lx) "
-                             "-> VirtualAlloc\n", size, static_cast<unsigned long>(type),
-                             static_cast<unsigned long>(protect));
-    return VirtualAlloc(nullptr, size, type, protect);
+    if (!logged.exchange(true)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemVirtualAlloc(address=%p, size=0x%llx, type=0x%lx, protect=0x%lx) "
+                     "-> VirtualAlloc(pc_type=0x%lx)\n",
+                     address, static_cast<unsigned long long>(size), static_cast<unsigned long>(type),
+                     static_cast<unsigned long>(protect), static_cast<unsigned long>(pc_type));
+    }
+    void* p = VirtualAlloc(address, size, pc_type, protect);
+    if (!p && GetLastError() == ERROR_INVALID_PARAMETER) {
+        const DWORD fallback_protect = (pc_type & MEM_COMMIT) ? PAGE_READWRITE : PAGE_NOACCESS;
+        p = VirtualAlloc(address, size, pc_type, fallback_protect);
+    }
+    if (!p) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemVirtualAlloc FAILED(address=%p, size=0x%llx, type=0x%lx, protect=0x%lx, err=%lu)\n",
+                     address, static_cast<unsigned long long>(size), static_cast<unsigned long>(type),
+                     static_cast<unsigned long>(protect), GetLastError());
+    }
+    return p;
 }
 
-// XMemAllocatePhysicalPages / XMemFreePhysicalPages: allocate/free physical page descriptors for
-// the Xbox's large-page physical heap. There is no equivalent on PC (physical pages are managed by
-// the kernel). Stub: zero the output page list and return E_NOTIMPL.
-// ASSUMPTION: out_pages is a pointer to an array of page descriptor handles (uint64_t each), and
-// page_count is the element count. The return type is HRESULT.
-HRESULT __stdcall XMemAllocatePhysicalPages(size_t /*size*/, uint64_t /*attributes*/,
-                                            void** out_pages) {
-    if (out_pages) *out_pages = nullptr;
+// XMemAllocatePhysicalPages / XMemFreePhysicalPages: allocate/free physical 64 KB page frame numbers
+// (mirroring Win32 AllocateUserPhysicalPages / FreeUserPhysicalPages).
+// Confirmed against game_scarlett_master.exe:
+//   BOOL XMemAllocatePhysicalPages(uint64_t flags, ULONG_PTR* number_of_pages, ULONG_PTR* page_array)
+constexpr size_t kXboxPhysicalPageSize = 65536;
+std::atomic<ULONG_PTR> g_next_pfn{1};
+
+BOOL __stdcall XMemAllocatePhysicalPages(uint64_t /*flags*/, ULONG_PTR* number_of_pages, ULONG_PTR* page_array) {
+    if (!number_of_pages) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const ULONG_PTR count = *number_of_pages;
+    if (count > 0 && page_array) {
+        ULONG_PTR base = g_next_pfn.fetch_add(count, std::memory_order_relaxed);
+        for (ULONG_PTR i = 0; i < count; ++i) {
+            page_array[i] = base + i;
+        }
+    }
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages stubbed -> E_NOTIMPL\n");
-    return E_NOTIMPL;
+        std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages(count=%llu) -> TRUE\n",
+                     static_cast<unsigned long long>(count));
+    return TRUE;
 }
 
-void __stdcall XMemFreePhysicalPages(void* /*pages*/, size_t /*count*/) {
+BOOL __stdcall XMemFreePhysicalPages(uint64_t /*flags*/, ULONG_PTR* /*number_of_pages*/, ULONG_PTR* /*page_array*/) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] xmem: XMemFreePhysicalPages stubbed -> no-op\n");
+        std::fprintf(stderr, "[rt] xmem: XMemFreePhysicalPages -> TRUE\n");
+    return TRUE;
 }
 
-// XMemMapPhysicalPages: maps a list of physical pages at a CPU virtual address.
-// No equivalent on PC; stub E_NOTIMPL.
-HRESULT __stdcall XMemMapPhysicalPages(void* /*va*/, size_t /*size*/, const void* /*pages*/) {
+// XMemMapPhysicalPages: maps (or unmaps when page_array == nullptr) `number_of_pages` 64 KB pages at `va`.
+BOOL __stdcall XMemMapPhysicalPages(void* va, ULONG_PTR number_of_pages, const ULONG_PTR* page_array) {
+    if (!va || number_of_pages == 0) return TRUE;
+    const SIZE_T bytes = static_cast<SIZE_T>(number_of_pages) * kXboxPhysicalPageSize;
+    if (page_array) {
+        if (!VirtualAlloc(va, bytes, MEM_COMMIT, PAGE_READWRITE)) return FALSE;
+    } else {
+        VirtualFree(va, bytes, MEM_DECOMMIT);
+    }
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages stubbed -> E_NOTIMPL\n");
-    return E_NOTIMPL;
+        std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages(va=%p, pages=%llu) -> TRUE\n", va,
+                     static_cast<unsigned long long>(number_of_pages));
+    return TRUE;
 }
 
-// XMemMapPhysicalPagesScatter: maps a scatter list of physical pages into separate CPU VAs.
-// No equivalent on PC; stub E_NOTIMPL.
-// ASSUMPTION: va_list is an array of `count` void* destination addresses; pages is the scatter source.
-HRESULT __stdcall XMemMapPhysicalPagesScatter(const void* /*pages*/, void** /*va_list*/,
-                                               size_t /*count*/) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPagesScatter stubbed -> E_NOTIMPL\n");
-    return E_NOTIMPL;
+// XMemMapPhysicalPagesScatter: maps (or unmaps) 64 KB physical pages into an array of CPU VAs.
+BOOL __stdcall XMemMapPhysicalPagesScatter(void** va_array, ULONG_PTR number_of_pages, const ULONG_PTR* page_array) {
+    if (!va_array || number_of_pages == 0) return TRUE;
+    for (ULONG_PTR i = 0; i < number_of_pages; ++i) {
+        if (!va_array[i]) continue;
+        if (page_array) {
+            if (!VirtualAlloc(va_array[i], kXboxPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return FALSE;
+        } else {
+            VirtualFree(va_array[i], kXboxPhysicalPageSize, MEM_DECOMMIT);
+        }
+    }
+    return TRUE;
 }
 
 // XMemTransferMemory: copies `size` bytes from src to dst, possibly using the Xbox DMA engine.

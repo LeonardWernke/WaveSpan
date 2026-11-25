@@ -1547,6 +1547,14 @@ The trace will enumerate them.
 - `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a separate `VkDeviceMemory`
   for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
   to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
+- Xbox device slot 133 imports a caller-owned buffer on devices with `VK_EXT_external_memory_host` and a compatible
+  coherent memory type. The caller keeps the committed CPU range alive through GPU completion and resource release.
+  The proxy accepts the observed default-state buffer call and the backend uses the original address, including for
+  `Map`. `d3d12_host_buffer_import` verifies a GPU copy between two original CPU allocations through slot 133.
+- Xbox descriptor heap creation can supply a backing address and byte count after the public description.
+  Slot 14 validates that pair against the descriptor stride, reuses a covering host import or imports the
+  committed range, and keeps the import alive through heap release. The same test checks CPU and GPU handles
+  for caller-backed heaps and places a short desktop description against an inaccessible page.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the

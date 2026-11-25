@@ -507,5 +507,94 @@ class ManifestBelowNormalTest(unittest.TestCase):
         manifest.below_normal()
 
 
+class ManifestScaleAndProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(self.pkg)
+        self.file_count = 40
+        for i in range(self.file_count):
+            with open(os.path.join(self.pkg, f"file_{i:03d}.bin"), "wb") as f:
+                f.write(f"payload-{i}".encode("utf-8"))
+        self.out = os.path.join(self.tmp.name, "manifest.json")
+
+    def test_create_and_verify_bound_in_flight_futures(self):
+        jobs = 2
+        limit = jobs * manifest.FUTURES_PER_WORKER
+        self.assertGreater(self.file_count, limit)
+        real_wait = manifest.wait
+
+        def spy_wait(observed):
+            def wrapper(fs, *args, **kwargs):
+                observed.append(len(fs))
+                return real_wait(fs, *args, **kwargs)
+            return wrapper
+
+        create_observed = []
+        with patch.object(manifest, "wait", side_effect=spy_wait(create_observed)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manifest.create(self.pkg, self.out, jobs=jobs), 0)
+
+        self.assertTrue(create_observed)
+        self.assertLessEqual(max(create_observed), limit)
+        self.assertEqual(len(manifest.load_manifest(self.out)), self.file_count)
+
+        verify_observed = []
+        with patch.object(manifest, "wait", side_effect=spy_wait(verify_observed)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manifest.verify(self.pkg, self.out, jobs=jobs), 0)
+
+        self.assertTrue(verify_observed)
+        self.assertLessEqual(max(verify_observed), limit)
+        self.assertIn("OK", out.getvalue())
+
+    def test_create_batches_progress_and_emits_final_completion(self):
+        ticks = iter([0.0] * 100)
+        out = io.StringIO()
+        with patch.object(manifest.time, "monotonic", side_effect=lambda: next(ticks)):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manifest.create(self.pkg, self.out, jobs=2), 0)
+
+        progress_lines = [line for line in out.getvalue().splitlines() if line.startswith("[")]
+        self.assertEqual(len(progress_lines), 1)
+        self.assertIn("100.0%", progress_lines[0])
+        self.assertIn(f"{self.file_count}/{self.file_count} files", progress_lines[0])
+
+    def test_create_and_verify_emit_periodic_progress_over_time(self):
+        # Advance monotonic clock by 0.05s per call so a 0.2s interval fires multiple times, not every file.
+        step = 0.05
+        counter = {"t": 0.0}
+
+        def fake_monotonic():
+            counter["t"] += step
+            return counter["t"]
+
+        create_out = io.StringIO()
+        with patch.object(manifest.time, "monotonic", side_effect=fake_monotonic):
+            with contextlib.redirect_stdout(create_out):
+                self.assertEqual(manifest.create(self.pkg, self.out, jobs=1), 0)
+
+        create_lines = [line for line in create_out.getvalue().splitlines() if line.startswith("[")]
+        self.assertGreater(len(create_lines), 1)
+        self.assertLess(len(create_lines), self.file_count)
+        self.assertIn("100.0%", create_lines[-1])
+        self.assertIn(f"{self.file_count}/{self.file_count} files", create_lines[-1])
+
+        counter["t"] = 0.0
+        verify_out = io.StringIO()
+        with patch.object(manifest.time, "monotonic", side_effect=fake_monotonic):
+            with contextlib.redirect_stdout(verify_out):
+                self.assertEqual(manifest.verify(self.pkg, self.out, jobs=1, launcher_progress=True), 0)
+
+        prefix = "@wavespan-progress "
+        events = [json.loads(line[len(prefix):]) for line in verify_out.getvalue().splitlines() if line.startswith(prefix)]
+        self.assertGreater(len(events), 1)
+        self.assertLess(len(events), self.file_count)
+        self.assertEqual(events[-1]["done"], self.file_count)
+        self.assertEqual(events[-1]["total"], self.file_count)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -577,6 +577,39 @@ def open_launcher(builder, default_out, find_dumps):
     root.mainloop()
 
 
+def limit_windows_build_cpu(percent):
+    """Cap the build worker and processes it starts as a single Windows job."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # JOBOBJECT_CPU_RATE_CONTROL_INFORMATION holds flags and hundredths of one percent.
+        enable_hard_cap = 0x1 | 0x4
+        cpu_rate_control = 15  # JobObjectCpuRateControlInformation
+        rate = (wintypes.DWORD * 2)(enable_hard_cap, percent * 100)
+        if not kernel.SetInformationJobObject(job, cpu_rate_control, ctypes.byref(rate), ctypes.sizeof(rate)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel.AssignProcessToJobObject(job, kernel.GetCurrentProcess()):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        # Windows keeps the job and its cap until all assigned processes exit.
+        kernel.CloseHandle(job)
+
+
 def run_windows_builder():
     """Receive Stop over a private pipe and deliver Ctrl+C to the builder's console."""
     import ctypes
@@ -601,7 +634,29 @@ def run_windows_builder():
 
     threading.Thread(target=wait_for_stop, daemon=True).start()
     try:
-        runpy.run_path(sys.argv.pop(1), run_name="__main__")
+        cpu_percent = 80
+        try:
+            limit_windows_build_cpu(cpu_percent)
+        except OSError as error:
+            print(f"Could not set the build CPU limit ({error}). The builder will run at below-normal priority.",
+                  flush=True)
+        else:
+            print(f"Build CPU limit set to {cpu_percent}% for the builder and its tools.", flush=True)
+        # The worker can be quiet for a long time during export or pipeline compilation.
+        # Ask Windows to stay awake until the build ends while allowing display sleep.
+        set_execution_state = kernel.SetThreadExecutionState
+        set_execution_state.argtypes = (wintypes.DWORD,)
+        set_execution_state.restype = wintypes.DWORD
+        continuous = 0x80000000  # ES_CONTINUOUS
+        system_required = 0x1  # ES_SYSTEM_REQUIRED
+        previous_state = set_execution_state(continuous | system_required)
+        try:
+            if not previous_state:
+                print("Windows could not prevent idle sleep during this build.", flush=True)
+            runpy.run_path(sys.argv.pop(1), run_name="__main__")
+        finally:
+            if previous_state:
+                set_execution_state(continuous | previous_state)
     except KeyboardInterrupt:
         raise SystemExit(130) from None
 

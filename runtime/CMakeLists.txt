@@ -92,6 +92,7 @@ if(WIN32)
 
   add_executable(gta6rt
     src/main.cpp
+    src/crash_dump.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -204,6 +205,14 @@ if(WIN32)
   target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
+
+  add_executable(crash_dump_test
+    test/crash_dump_test.cpp
+    src/crash_dump.cpp
+  )
+  target_compile_definitions(crash_dump_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(crash_dump_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_libraries(crash_dump_test PRIVATE psapi)
 
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
@@ -891,14 +900,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_multithread COMMAND d3d12_multithread_test)
     set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # A queued Wait must not block a Signal submitted by another D3D12 queue.
-    add_executable(d3d12_queue_wait_test test/d3d12_queue_wait_test.cpp)
+    add_executable(d3d12_queue_wait_test test/d3d12_queue_wait_test.cpp shims/d3d12_xs_device.cpp)
     target_link_libraries(d3d12_queue_wait_test PRIVATE gta6rt_d3d12_com)
-    target_compile_definitions(d3d12_queue_wait_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(d3d12_queue_wait_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WAVESPAN_VULKAN_DEVICE)
     target_compile_options(d3d12_queue_wait_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_wait COMMAND d3d12_queue_wait_test)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
     set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
+    add_test(NAME d3d12_host_buffer_import COMMAND d3d12_queue_wait_test --host-import)
+    set_tests_properties(d3d12_host_buffer_import PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.

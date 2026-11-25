@@ -363,11 +363,29 @@ struct TextureCreateInfo {
 
 class DescriptorHeap;
 
+struct HostBufferBacking {
+    VkDevice device;
+    PFN_vkDestroyBuffer destroy_buffer;
+    PFN_vkFreeMemory free_memory;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    std::uintptr_t cpu;
+    VkDeviceSize size;
+    VkDeviceAddress va;
+
+    ~HostBufferBacking() {
+        destroy_buffer(device, buffer, nullptr);
+        free_memory(device, memory, nullptr);
+    }
+};
+
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
     std::unique_ptr<wavespan::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
+    std::mutex host_buffers_mutex;
+    std::vector<std::weak_ptr<HostBufferBacking>> host_buffers;
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (wavespan::resizable_bar); WAVESPAN_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
@@ -1207,9 +1225,14 @@ public:
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
-    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                   std::shared_ptr<HostBufferBacking> backing = {}, VkDeviceSize offset = 0)
+        : device_(device), desc_(desc), host_backing_(std::move(backing)) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
-        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+        if (host_backing_) {
+            cpu_ = reinterpret_cast<std::uint8_t*>(host_backing_->cpu + offset);
+            arena_offset_ = host_backing_->va + offset;
+        } else if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_)) {
                 log_once("GPU address arena full (raise WAVESPAN_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
@@ -1300,8 +1323,9 @@ public:
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
-        if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
-        return {in_arena_ ? UINT64(arena_offset_) : 0};
+        if (!in_arena_ && !host_backing_)
+            log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
+        return {(in_arena_ || host_backing_) ? UINT64(arena_offset_) : 0};
     }
 
 private:
@@ -1382,6 +1406,7 @@ private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     std::unique_ptr<std::byte[]> storage_;
+    std::shared_ptr<HostBufferBacking> host_backing_;
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
@@ -1458,8 +1483,15 @@ public:
         device_.context->remove_resource(id());
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
         if (image_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::image, image_);
-        if (buffer_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::buffer, buffer_);
-        if (memory_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::device_memory, memory_);
+        if (borrowed_host_memory_ && !host_backing_) {
+            // The application must finish GPU use before releasing a D3D12 resource. End the Vulkan import
+            // synchronously so the application can release its CPU allocation as soon as Release returns.
+            if (buffer_) device_.context->vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            if (memory_) device_.context->vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+        } else if (!borrowed_host_memory_) {
+            if (buffer_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::buffer, buffer_);
+            if (memory_) device_.context->defer_destroy(wavespan::DeferredDeletionQueue::Kind::device_memory, memory_);
+        }
         if (placed_heap_) placed_heap_->Release();
     }
 
@@ -1483,14 +1515,15 @@ public:
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
     // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
-    HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
+    HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON,
+                          void* host_address = nullptr) {
         auto& vk = device_.context->vk;
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
         if (!desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
         const bool host = cpu_visible();
         wavespan::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
-        if (!host && device_.arena.mapped) {
+        if (!host_address && !host && device_.arena.mapped) {
             if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
                 log_once("GPU address arena full (raise WAVESPAN_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
@@ -1535,6 +1568,25 @@ public:
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         }
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        if (host_address) {
+            const auto& device = device_.info;
+            const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalBufferProperties>(
+                device.get_instance_proc(device.instance, "vkGetPhysicalDeviceExternalBufferProperties"));
+            if (!device.host_import_alignment || !query) return E_NOTIMPL;
+            VkPhysicalDeviceExternalBufferInfo request{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+            request.usage = info.usage;
+            request.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkExternalBufferProperties properties{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            query(device.physical, &request, &properties);
+            const auto features = properties.externalMemoryProperties.externalMemoryFeatures;
+            // Host-pointer allocations cannot be dedicated (VUID-VkMemoryAllocateInfo-pNext-02806).
+            if (!(features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+                (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT)) return E_NOTIMPL;
+            borrowed_host_memory_ = true;
+            info.pNext = &external;
+        }
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -1544,7 +1596,10 @@ public:
         if (heap_.Type == D3D12_HEAP_TYPE_READBACK) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
             host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        memory_ = host ? device_.allocate(requirements,
+        if (host_address) {
+            const HRESULT hr = import_host_memory(host_address, requirements, addressable || need_bda);
+            if (FAILED(hr)) return hr;
+        } else memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                           host_preferred, &memory_flags_, addressable || need_bda)
                        : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
@@ -1556,7 +1611,9 @@ public:
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
         }
-        if (host) {
+        if (host_address) {
+            mapped_ = host_address;
+        } else if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
                 return E_OUTOFMEMORY;
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
@@ -1589,10 +1646,17 @@ public:
         }
         binding.buffer = buffer_;
         binding.size = desc_.Width;
-        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+        binding.host_readable = (host_address || heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
+        if (host_address) {
+            host_backing_ = std::make_shared<HostBufferBacking>(device_.info.device, vk.vkDestroyBuffer,
+                vk.vkFreeMemory, buffer_, memory_, reinterpret_cast<std::uintptr_t>(host_address), desc_.Width, va_);
+            std::lock_guard lock(device_.host_buffers_mutex);
+            std::erase_if(device_.host_buffers, [](const auto& weak) { return weak.expired(); });
+            device_.host_buffers.push_back(host_backing_);
+        }
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -1911,6 +1975,51 @@ public:
     }
 
 private:
+    HRESULT import_host_memory(void* address, const VkMemoryRequirements& requirements, bool bda) {
+        const auto& info = device_.info;
+        const auto alignment = info.host_import_alignment;
+        const auto base = reinterpret_cast<std::uintptr_t>(address);
+        if (base % alignment || requirements.size > UINT64_MAX - (alignment - 1)) return E_INVALIDARG;
+        const VkDeviceSize bytes = (requirements.size + alignment - 1) / alignment * alignment;
+        if (bytes > UINTPTR_MAX - base) return E_INVALIDARG;
+        for (auto pos = base; pos < base + bytes;) {
+            MEMORY_BASIC_INFORMATION range{};
+            if (!VirtualQuery(reinterpret_cast<void*>(pos), &range, sizeof(range)) || range.State != MEM_COMMIT ||
+                range.Type != MEM_PRIVATE || (range.Protect != PAGE_READWRITE && range.Protect != PAGE_EXECUTE_READWRITE))
+                return E_INVALIDARG;
+            const auto end = reinterpret_cast<std::uintptr_t>(range.BaseAddress) + range.RegionSize;
+            if (end <= pos) return E_INVALIDARG;
+            pos = end;
+        }
+        const auto get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+        const auto query = get_device ? reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT")) : nullptr;
+        if (!query) return E_NOTIMPL;
+        constexpr auto handle = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (query(info.device, handle, address, &host) != VK_SUCCESS) return E_INVALIDARG;
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = handle;
+        import.pHostPointer = address;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.pNext = bda ? static_cast<const void*>(&flags) : &import;
+        allocation.allocationSize = bytes;
+        constexpr auto coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const auto candidates = wavespan::memory_type_order(device_.memory,
+            requirements.memoryTypeBits & host.memoryTypeBits, coherent, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, bytes);
+        for (const auto index : candidates) {
+            allocation.memoryTypeIndex = index;
+            if (device_.context->vk.vkAllocateMemory(info.device, &allocation, nullptr, &memory_) == VK_SUCCESS) {
+                memory_flags_ = device_.memory.memoryTypes[index].propertyFlags;
+                return S_OK;
+            }
+        }
+        return candidates.empty() ? E_NOTIMPL : E_OUTOFMEMORY;
+    }
+
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
     struct Region {
         VkImageSubresourceLayers layers;
@@ -2145,6 +2254,8 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    bool borrowed_host_memory_ = false;
+    std::shared_ptr<HostBufferBacking> host_backing_;
     ID3D12Heap* placed_heap_ = nullptr;
 };
 
@@ -4096,6 +4207,60 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                                    void** out) override {
+        return create_descriptor_heap(desc, riid, out);
+    }
+
+    HRESULT create_host_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out) {
+        if (!desc || desc->NodeMask != 1 || !desc->NumDescriptors) return S_FALSE;
+        const auto alignment = state_.info.host_import_alignment;
+        if (!alignment) return S_FALSE;
+        // A desktop description is only 16 bytes. Probe the optional Xbox suffix without faulting.
+        struct XboxBacking { std::uintptr_t address; std::size_t bytes; } suffix{};
+        const auto tail = reinterpret_cast<std::uintptr_t>(desc) + sizeof(*desc);
+        const VkDeviceSize bytes = VkDeviceSize(desc->NumDescriptors) * kDescriptorSize;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(tail), &suffix, sizeof(suffix), nullptr) ||
+            !suffix.address || suffix.address % kDescriptorSize || suffix.bytes != bytes) return S_FALSE;
+
+        VkDeviceSize offset = 0;
+        auto find_backing = [&]() -> std::shared_ptr<HostBufferBacking> {
+            std::lock_guard lock(state_.host_buffers_mutex);
+            for (const auto& weak : state_.host_buffers) {
+                auto candidate = weak.lock();
+                if (!candidate || suffix.address < candidate->cpu) continue;
+                const auto relative = suffix.address - candidate->cpu;
+                if (relative >= candidate->size || bytes > candidate->size - relative) continue;
+                offset = relative;
+                return candidate;
+            }
+            return {};
+        };
+        auto backing = find_backing();
+        if ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !state_.arena.buffer) return E_NOTIMPL;
+        if (backing) return create_descriptor_heap(desc, riid, out, std::move(backing), offset);
+
+        // The title can use a separate CPU reservation for a descriptor heap. Import the aligned
+        // range around its supplied address and retain it in the heap after releasing the temporary resource.
+        const auto base = suffix.address - suffix.address % alignment;
+        MEMORY_BASIC_INFORMATION range{};
+        if (!VirtualQuery(reinterpret_cast<void*>(base), &range, sizeof(range)) || range.State != MEM_COMMIT ||
+            range.Type != MEM_PRIVATE || range.Protect != PAGE_READWRITE) return S_FALSE;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = bytes + (suffix.address - base);
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* resource = nullptr;
+        const HRESULT imported = create_host_buffer(reinterpret_cast<void*>(base), buffer, IID_PPV_ARGS(&resource));
+        if (FAILED(imported)) return imported;
+        backing = find_backing();
+        resource->Release();
+        return backing ? create_descriptor_heap(desc, riid, out, std::move(backing), offset) : E_FAIL;
+    }
+
+    HRESULT create_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out,
+                                   std::shared_ptr<HostBufferBacking> backing = {}, VkDeviceSize offset = 0) {
         constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
         if (out) *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
@@ -4109,7 +4274,7 @@ public:
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        auto* heap = new DescriptorHeap(state_, *desc);
+        auto* heap = new DescriptorHeap(state_, *desc, std::move(backing), offset);
         heap->attach_device(identity());
         if (!heap->ok()) {
             heap->Release();
@@ -6040,6 +6205,24 @@ private:
     }
 
 public:
+    HRESULT create_host_buffer(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+        if (!state_.info.host_import_alignment) return E_NOTIMPL;
+        if (!address || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN ||
+            desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR || desc.Height != 1 || desc.DepthOrArraySize != 1 ||
+            desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+            return E_INVALIDARG;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                                        D3D12_MEMORY_POOL_L0, 1, 1};
+        auto* resource = new (std::nothrow) Resource(state_, desc, heap, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
+        if (!resource) return E_OUTOFMEMORY;
+        resource->attach_device(identity());
+        HRESULT hr = resource->create_buffer(D3D12_RESOURCE_STATE_COMMON, address);
+        if (SUCCEEDED(hr)) hr = resource->QueryInterface(riid, out);
+        resource->Release();
+        return hr;
+    }
+
     // The tiling of a reserved resource's description; false for formats without a tile shape (three- and
     // twelve-byte texels, two-plane depth-stencil).
     static bool resource_tiling(const D3D12_RESOURCE_DESC& desc, wavespan::ResourceTiling& out) {
@@ -6145,6 +6328,21 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     if (Device* d = Device::from<Device>(device)) d->set_outer(outer);
+}
+
+HRESULT create_vulkan_host_buffer(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                  REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    auto* d = device ? Device::from<Device>(device) : nullptr;
+    const HRESULT hr = d ? d->create_host_buffer(address, desc, riid, out) : E_NOTIMPL;
+    return d3d12_trace::result("Xbox device slot 133 host buffer", hr);
+}
+
+HRESULT create_vulkan_host_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                           REFIID riid, void** out) {
+    auto* d = device ? Device::from<Device>(device) : nullptr;
+    return d ? d->create_host_descriptor_heap(desc, riid, out) : S_FALSE;
 }
 
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) {
@@ -6610,6 +6808,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
             } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
                 has_swapchain = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+                VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host};
+                vkGetPhysicalDeviceProperties2(info.physical, &properties);
+                info.host_import_alignment = host.minImportedHostPointerAlignment;
             } else if (!std::strcmp(e.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
                 has_as = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
@@ -6851,6 +7055,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (info.host_import_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);

@@ -331,6 +331,7 @@ public sealed class MainForm : Form
         }
 
         _starting = true;
+        PostMessage(new { type = "buildStarting", checkOnly });
         int code = -1;
         try
         {
@@ -338,12 +339,13 @@ public sealed class MainForm : Form
             if (IsDisposed)
                 return;
             string worker = Path.Combine(_repoRoot, "tools", "wavespan_launcher.py");
-            var args = new List<string> { "-I", "-X", "utf8", "-u", worker, _makeGamePath, "--game", game };
+            var args = new List<string> { "-I", "-X", "utf8", "-u", worker, _makeGamePath, "--game", game,
+                "--launcher-progress" };
             if (checkOnly)
                 args.Add("--check");
             else
             {
-                args.AddRange(["--out", output, "--launcher-progress"]);
+                args.AddRange(["--out", output]);
                 if (!string.IsNullOrWhiteSpace(work))
                     args.AddRange(["--work", work]);
             }

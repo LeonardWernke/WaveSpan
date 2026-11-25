@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "base_reservation.h"
+#include "crash_dump.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
@@ -52,7 +53,7 @@ int usage() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path image, game_dir, overlay_dir;
+    std::filesystem::path image, game_dir, overlay_dir, crash_dir;
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     for (int i = 1; i < argc; ++i) {
@@ -67,6 +68,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
+        else if (a == L"--crash-dir" && i + 1 < argc) crash_dir = argv[++i];
         else if (image.empty()) image = a;
         else return usage();
     }
@@ -80,6 +82,8 @@ int wmain(int argc, wchar_t** argv) {
         if (const auto range = rt::base_reservation::needed(image)) return rt::base_reservation::relaunch(*range);
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
+    if (crash_dir.empty()) crash_dir = rt::crash_dump::default_error_dir(overlay_dir);
+    rt::crash_dump::install(crash_dir, trace_d3d12);
     rt::fs::configure(game_dir, overlay_dir);
     rt::d3d12_trace::set_enabled(trace_d3d12);
 

@@ -10,14 +10,17 @@ On Windows it lowers its own priority to BelowNormal so the PC stays usable.
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 CHUNK = 8 * 1024 * 1024
+FUTURES_PER_WORKER = 4
+PROGRESS_INTERVAL = 0.2
 DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 
 
@@ -113,6 +116,24 @@ def walk(game_dir: str, *, exclude=None):
             yield os.path.relpath(p, game_dir).replace("\\", "/"), p
 
 
+def _run_jobs(items, fn, jobs: int):
+    """Yield ``fn(item)`` results, using up to ``jobs`` threads with bounded in-flight futures."""
+    if jobs == 1:
+        for item in items:
+            yield fn(item)
+        return
+    max_in_flight = jobs * FUTURES_PER_WORKER
+    it = iter(items)
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        in_flight = {pool.submit(fn, item) for item in itertools.islice(it, max_in_flight)}
+        while in_flight:
+            done_set, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done_set:
+                yield future.result()
+                for next_item in itertools.islice(it, 1):
+                    in_flight.add(pool.submit(fn, next_item))
+
+
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
     # walk() excludes the manifest path itself, so an existing game file named like --out would otherwise be
     # hashed first and replaced by the manifest (os.replace below), leaving the recorded hash wrong. Allow only an
@@ -141,31 +162,29 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
     total = sum(sizes.values())
     entries = {}
     done = count = 0
-    t0 = time.time()
+    t0 = time.monotonic()
+    last_progress = t0
 
     def finish(rel: str, size: int, digest: str) -> None:
-        nonlocal done, count
+        nonlocal done, count, last_progress
         entries[rel] = {"size": size, "sha256": digest}
         done += size
         count += 1
-        rate = done / max(time.time() - t0, 1e-6) / 2**20
-        pct = done / total if total else 1.0
-        # One line per completed file, printed only from the main thread. Completion order is not
-        # stable with threads, so this reports counts and bytes rather than coupling output to a path.
-        print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
+        now = time.monotonic()
+        if count == len(files) or now - last_progress >= PROGRESS_INTERVAL:
+            last_progress = now
+            rate = done / max(now - t0, 1e-6) / 2**20
+            pct = done / total if total else 1.0
+            # Printed only from the main thread, throttled to avoid per-file flush overhead on large trees.
+            print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
 
-    def work(rel: str, path: str) -> tuple[str, int, str]:
+    def work(item: tuple[str, str]) -> tuple[str, int, str]:
+        rel, path = item
         size, digest = _hash_file(path, expected_size=sizes[path])
         return rel, size, digest
 
-    if jobs == 1:
-        for rel, p in files:
-            finish(*work(rel, p))
-    else:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [pool.submit(work, rel, p) for rel, p in files]
-            for future in as_completed(futures):
-                finish(*future.result())
+    for rel, size, digest in _run_jobs(files, work, jobs):
+        finish(rel, size, digest)
 
     # Re-insert in walk order so the JSON is independent of which worker finished first.
     entries = {rel: entries[rel] for rel, _ in files}
@@ -197,7 +216,7 @@ def load_manifest(manifest: str) -> dict:
     return files
 
 
-def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
+def verify(game_dir: str, manifest: str, jobs: int = 1, *, launcher_progress: bool = False) -> int:
     want = load_manifest(manifest)
     have = dict(walk(game_dir, exclude=manifest))
     problems = {}
@@ -216,17 +235,25 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
             except OSError:
                 problems[rel] = "MISSING"
 
-    if jobs == 1:
-        for rel, p, digest in pending:
-            if sha256(p) != digest:
-                problems[rel] = "CHANGED"
-    else:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = {pool.submit(sha256, p): (rel, digest) for rel, p, digest in pending}
-            for future in as_completed(futures):
-                rel, digest = futures[future]
-                if future.result() != digest:
-                    problems[rel] = "CHANGED"
+    last_progress = time.monotonic()
+
+    def finish(index, rel, expected, actual):
+        nonlocal last_progress
+        if actual != expected:
+            problems[rel] = "CHANGED"
+        if launcher_progress:
+            now = time.monotonic()
+            if index == len(pending) or now - last_progress >= PROGRESS_INTERVAL:
+                last_progress = now
+                progress = dict(stage="check", detail="Verifying SHA-256 hashes", done=index, total=len(pending))
+                print("@wavespan-progress " + json.dumps(progress), flush=True)
+
+    def check(item: tuple[str, str, str]) -> tuple[str, str, str]:
+        rel, path, expected = item
+        return rel, expected, sha256(path)
+
+    for index, (rel, expected, actual) in enumerate(_run_jobs(pending, check, jobs), 1):
+        finish(index, rel, expected, actual)
 
     # Print in manifest order, not completion order, so the report is identical for any --jobs.
     bad = 0
@@ -254,13 +281,14 @@ def main() -> int:
     c = sub.add_parser("create"); c.add_argument("game_dir"); c.add_argument("--out", default=DEFAULT)
     add_jobs(c)
     v = sub.add_parser("verify"); v.add_argument("game_dir"); v.add_argument("--manifest", default=DEFAULT)
+    v.add_argument("--launcher-progress", action="store_true", help=argparse.SUPPRESS)
     add_jobs(v)
     a = ap.parse_args()
     below_normal()
     try:
         if a.cmd == "create":
             return create(a.game_dir, a.out, a.jobs)
-        return verify(a.game_dir, a.manifest, a.jobs)
+        return verify(a.game_dir, a.manifest, a.jobs, launcher_progress=a.launcher_progress)
     except (OSError, ManifestError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2

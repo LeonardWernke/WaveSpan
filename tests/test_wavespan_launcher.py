@@ -7,8 +7,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from html.parser import HTMLParser
+from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +41,56 @@ def _make_stub_launcher():
 
 
 class WavespanLauncherTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows execution state")
+    def test_running_builder_requests_idle_sleep_prevention(self):
+        probe = '''
+import ctypes
+from ctypes import wintypes
+
+set_state = ctypes.windll.kernel32.SetThreadExecutionState
+set_state.argtypes = (wintypes.DWORD,)
+set_state.restype = wintypes.DWORD
+previous = set_state(0x80000001)
+assert previous & 1, f"The worker did not request idle sleep prevention: {previous:#x}"
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            builder = Path(directory) / "builder.py"
+            builder.write_text(probe, encoding="utf-8", newline="\n")
+            result = subprocess.run(
+                [sys.executable, "-I", "-u", os.path.join(TOOLS_DIR, "wavespan_launcher.py"), str(builder)],
+                stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace", timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows job objects")
+    def test_build_worker_and_child_share_cpu_limit(self):
+        probe = '''
+import ctypes
+from ctypes import wintypes
+
+query = ctypes.WinDLL("kernel32", use_last_error=True).QueryInformationJobObject
+query.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD)
+query.restype = wintypes.BOOL
+rate = (wintypes.DWORD * 2)()
+if not query(None, 15, ctypes.byref(rate), ctypes.sizeof(rate), None):
+    raise ctypes.WinError(ctypes.get_last_error())
+print(f"job CPU rate {rate[0]} {rate[1]}")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            builder = Path(directory) / "builder.py"
+            builder.write_text(
+                probe + f'\nimport subprocess, sys\nsubprocess.run([sys.executable, "-I", "-c", {probe!r}], check=True)\n',
+                encoding="utf-8", newline="\n",
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-u", os.path.join(TOOLS_DIR, "wavespan_launcher.py"), str(builder)],
+                stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace", timeout=20,
+            )
+        if re.search(r"Could not set the build CPU limit \(\[WinError (?:5|50)\]", result.stdout):
+            self.skipTest("Windows disallows CPU limits in this test environment")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines().count("job CPU rate 5 8000"), 2, result.stdout)
+
     def test_close_destroys_immediately_when_idle(self):
         launcher = _make_stub_launcher()
         launcher.close()
@@ -134,7 +186,7 @@ class WaveSpanWebLauncherTests(unittest.TestCase):
         match = re.search(r"@media\s*\(forced-colors:\s*active\)\s*\{(.*)\}\s*$", css, re.DOTALL)
         self.assertIsNotNone(match, "Expected @media (forced-colors: active) block in styles.css")
         block = match.group(1)
-        for selector in (".progress-bar", ".wave-divider", ".hero-status::before"):
+        for selector in (".stage-bar", ".graph-meter", ".wave-divider", ".hero-status::before"):
             self.assertIn(selector, block)
 
     def test_app_js_strips_quotes_and_updates_status(self):
@@ -244,20 +296,27 @@ assert.deepStrictEqual(normalize(posted.shift()), {
 });
 
 for (const fn of webviewListeners.message) {
-  fn({ data: { type: "buildStarted", checkOnly: false } });
+  fn({ data: { type: "buildStarting", checkOnly: false } });
 }
-assert.strictEqual(elements.statusLabel.textContent, "Building workspace\u2026");
-assert.strictEqual(elements.heroStatus.textContent, "Building workspace\u2026");
-assert.strictEqual(elements.stopBtn.disabled, false);
-assert.strictEqual(elements.progressTrack.classList.contains("hidden"), true);
+assert.strictEqual(elements.statusLabel.textContent, "Loading");
+assert.strictEqual(elements.heroStatus.textContent, "Loading");
+assert.strictEqual(elements.stopBtn.disabled, true);
 assert.strictEqual(elements.buildGraph.hidden, false);
 assert.strictEqual(checkStage.dataset.state, "waiting");
 
 for (const fn of webviewListeners.message) {
-  fn({ data: { type: "buildProgress", progress: { stage: "check", detail: "Checking package" } } });
+  fn({ data: { type: "buildStarted", checkOnly: false } });
+}
+assert.strictEqual(elements.stopBtn.disabled, false);
+assert.strictEqual(elements.activityWave.hidden, false);
+
+for (const fn of webviewListeners.message) {
+  fn({ data: { type: "buildProgress", progress: { stage: "check", detail: "Checking package", done: 1, total: 20 } } });
 }
 assert.strictEqual(checkStage.getAttribute("aria-current"), "step");
 assert.strictEqual(elements.graphPhase.textContent, "Checking package");
+assert.strictEqual(elements.fileCount.textContent, "File 1/20");
+assert.strictEqual(elements.graphMeter.hidden, false);
 
 for (const fn of webviewListeners.message) {
   fn({ data: { type: "buildFinished", returnCode: 0, checkOnly: false, stopped: false } });
@@ -266,7 +325,8 @@ assert.strictEqual(elements.statusLabel.textContent, "Build complete");
 assert.strictEqual(elements.heroStatus.textContent, "Build complete");
 assert.strictEqual(elements.heroBanner.dataset.tone, "success");
 assert.strictEqual(elements.stopBtn.disabled, true);
-assert.strictEqual(elements.progressTrack.classList.contains("hidden"), true);
+assert.strictEqual(elements.activityWave.hidden, true);
+assert.strictEqual(elements.graphMeter.hidden, true);
 assert.strictEqual(checkStage.dataset.state, "complete");
 assert.strictEqual(checkStage.getAttribute("aria-current"), undefined);
 """
@@ -290,6 +350,7 @@ assert.strictEqual(checkStage.getAttribute("aria-current"), undefined);
         self.assertIn("NormalizePathInput(work)", start_build)
         self.assertIn("Directory.Exists(game)", start_build)
         self.assertLess(start_build.index("Directory.Exists(game)"), start_build.index("FindPythonAsync()"))
+        self.assertIn("await process.WaitForExitAsync();", start_build)
 
         # 3. OnFormClosing handles StopBuild() == false without stranding the window open.
         on_closing = cs[cs.index("private void OnFormClosing("):cs.index("private void OnWebMessageReceived(")]

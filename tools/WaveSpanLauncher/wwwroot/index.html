@@ -106,12 +106,12 @@
         <h2>Build activity</h2>
         <div class="toolbar-right">
           <span id="statusLabel" class="status-label" role="status" aria-live="polite">Ready</span>
+          <span id="activityWave" class="activity-wave" aria-hidden="true" hidden>
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+          </span>
+          <span id="fileCount" class="graph-units" aria-label="File progress" hidden></span>
           <button id="stopBtn" class="btn btn-secondary" type="button" disabled>Stop</button>
         </div>
-      </div>
-
-      <div id="progressTrack" class="progress-track hidden" aria-hidden="true">
-        <div class="progress-bar"></div>
       </div>
 
       <div class="console-frame">

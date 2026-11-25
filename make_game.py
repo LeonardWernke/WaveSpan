@@ -633,7 +633,8 @@ def check(game: str, full: bool) -> dict:
     v = load_version(game)
     log(f"check: {v['title']} {v['version']}, {len(v['files'])} files")
     bad = 0
-    for rel, info in v["files"].items():
+    total = len(v["files"])
+    for index, (rel, info) in enumerate(v["files"].items(), 1):
         p = os.path.join(game, rel)
         try:
             st = os.stat(p)
@@ -645,11 +646,14 @@ def check(game: str, full: bool) -> dict:
             print(f"  missing  {rel}"); bad += 1
         except OSError:
             print(f"  missing  {rel}"); bad += 1
+        report_progress("check", "Checking package files", index, total)
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     if full:
         report_progress("check", "Verifying SHA-256 hashes")
-        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
+        progress_args = ["--launcher-progress"] if _launcher_progress else []
+        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"),
+           *progress_args)
     exe = os.path.join(game, v["expected_exe"])
     try:
         exe_found = stat.S_ISREG(os.stat(exe).st_mode)

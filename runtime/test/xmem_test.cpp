@@ -17,6 +17,7 @@ namespace {
 
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
+using XMemVirtualAllocFn = void*(__stdcall*)(void*, size_t, DWORD, DWORD, uint64_t);
 using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
 // BOOL XMemGetWorkingSetStatistics(UINT32 kind, stats*): the FSR DLL passes kind 0x20000001 at every call site.
 using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
@@ -129,6 +130,55 @@ void test_virtual_query(XMemVirtualQueryFn query) {
     check(bad == 0, "XMemVirtualQuery on an invalid address returns 0 without crashing");
 }
 
+void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc) {
+    constexpr size_t page = 64 * 1024;
+    auto* placeholder = static_cast<uint8_t*>(virtual_alloc(nullptr, 2 * page,
+        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, 1));
+    check(placeholder != nullptr, "XMemVirtualAlloc reserves a splittable placeholder");
+    if (placeholder) {
+        const bool split = VirtualFree(placeholder, page, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+        check(split, "VirtualFree splits the XMem placeholder");
+        if (split) {
+            void* const replaced = virtual_alloc(placeholder, page,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_LARGE_PAGES | 0x00400000u, 0x27, 1);
+            check(replaced == placeholder, "XMemVirtualAlloc replaces a split placeholder in place");
+            if (replaced)
+                check(VirtualAlloc(replaced, page, MEM_COMMIT, PAGE_READWRITE) == replaced,
+                      "the replaced reservation can be committed");
+            check(VirtualFree(placeholder + page, 0, MEM_RELEASE) != FALSE, "release the untouched placeholder");
+        }
+        check(VirtualFree(placeholder, 0, MEM_RELEASE) != FALSE, "release the first reservation");
+    }
+
+    // Measured flags from game_scarlett_master.exe: MEM_RESERVE (0x2000) | MEM_LARGE_PAGES (0x20000000) | Xbox
+    // 0x00400000.
+    constexpr DWORD kXboxReserveFlags = 0x20402000u;
+    void* const reserved = virtual_alloc(nullptr, 64 * 1024, kXboxReserveFlags, PAGE_READWRITE, 0);
+    check(reserved != nullptr, "XMemVirtualAlloc(nullptr, 64K, 0x20402000, PAGE_READWRITE, 0) reserves memory");
+
+    if (reserved) {
+        void* const committed = virtual_alloc(reserved, 4096, MEM_COMMIT, PAGE_READWRITE, 0);
+        check(committed == reserved, "XMemVirtualAlloc commits a page inside the reserved region");
+        bool rw_ok = false;
+        if (committed) {
+            auto* bytes = static_cast<uint8_t*>(committed);
+            bytes[0] = 0x5a;
+            rw_ok = bytes[0] == 0x5a;
+        }
+        check(rw_ok, "XMemVirtualAlloc committed page is writable and readable");
+        check(VirtualFree(reserved, 0, MEM_RELEASE) != FALSE, "VirtualFree releases XMemVirtualAlloc reservation");
+    }
+
+    void* const direct = virtual_alloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0);
+    check(direct != nullptr, "XMemVirtualAlloc(nullptr, 4K, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE, 0) succeeds");
+    if (direct) {
+        auto* bytes = static_cast<uint8_t*>(direct);
+        bytes[0] = 0x3c;
+        check(bytes[0] == 0x3c, "XMemVirtualAlloc direct commit is writable and readable");
+        check(VirtualFree(direct, 0, MEM_RELEASE) != FALSE, "VirtualFree releases direct XMemVirtualAlloc block");
+    }
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -145,16 +195,19 @@ int main() {
 
     const auto alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));
     const auto free_mem = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFree"));
+    const auto virtual_alloc =
+        reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
     const auto query = reinterpret_cast<XMemVirtualQueryFn>(rt::shims::find("xmem.dll", "XMemVirtualQuery"));
     const auto get_stats =
         reinterpret_cast<XMemGetWorkingSetStatisticsFn>(rt::shims::find("xmem.dll", "XMemGetWorkingSetStatistics"));
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
+    check(virtual_alloc != nullptr, "registry exposes xmem.dll!XMemVirtualAlloc");
     check(query != nullptr, "registry exposes xmem.dll!XMemVirtualQuery");
     check(get_stats != nullptr, "registry exposes xmem.dll!XMemGetWorkingSetStatistics");
 
-    if (!alloc || !free_mem || !query || !get_stats) {
+    if (!alloc || !free_mem || !virtual_alloc || !query || !get_stats) {
         print_result();
         return 1;
     }
@@ -162,6 +215,7 @@ int main() {
     test_alloc(alloc, free_mem);
     test_working_set(get_stats);
     test_virtual_query(query);
+    test_virtual_alloc(virtual_alloc);
 
     print_result();
     return g_failures ? 1 : 0;

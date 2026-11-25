@@ -400,6 +400,18 @@ int main() {
                                                          nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                          &iid_resource, &proxy_out);
         check(FAILED(hr) && proxy_out == nullptr, "slot 76 nulls its output for a null description");
+
+        // Unknown Xbox arguments must never reach the desktop slot of the same number.
+        using Slot78Fn = uint64_t(WINAPI*)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t, uint64_t, uint64_t, uint64_t);
+        hr = static_cast<HRESULT>(reinterpret_cast<Slot78Fn>(proxy_vtbl[78])(
+            device.Get(), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14));
+        check(hr == E_NOTIMPL, "slot 78 rejects an unverified Xbox call without forwarding it");
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = static_cast<HRESULT>(reinterpret_cast<Slot78Fn>(proxy_vtbl[133])(
+            device.Get(), 0, 0, UINT(-1), 0, 0, reinterpret_cast<uint64_t>(&proxy_out), 0, 0, 0, 0, 0, 0, 0, 0));
+        check(hr == E_NOTIMPL && proxy_out == nullptr, "slot 133 in the PC-only proxy refuses the host buffer");
     }
 
     // Slots 8 and 36 on the device the shim made: a title gets queue and fence proxies, and they run GPU work.

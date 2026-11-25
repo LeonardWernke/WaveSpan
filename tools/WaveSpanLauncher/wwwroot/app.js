@@ -20,7 +20,8 @@ const graphPhase = document.getElementById("graphPhase");
 const graphUnits = document.getElementById("graphUnits");
 const graphMeter = document.getElementById("graphMeter");
 const statusLabel = document.getElementById("statusLabel");
-const progressTrack = document.getElementById("progressTrack");
+const activityWave = document.getElementById("activityWave");
+const fileCount = document.getElementById("fileCount");
 const logConsole = document.getElementById("logConsole");
 
 const formWidgets = [
@@ -51,15 +52,16 @@ function setStatus(text, tone = "") {
 let building = false;
 let scanning = false;
 
-function setBusy(busy, checkOnly = false) {
+function setBusy(busy, canStop = busy) {
   building = busy;
   heroBanner.classList.toggle("is-active", busy);
   for (const el of formWidgets) {
     el.disabled = busy;
   }
   scanBtn.disabled = building || scanning;
-  stopBtn.disabled = !busy;
-  progressTrack.classList.toggle("hidden", !busy || !checkOnly);
+  stopBtn.disabled = !canStop;
+  activityWave.hidden = !busy;
+  fileCount.hidden = true;
 }
 
 function setGraphPhase(detail, done, total) {
@@ -202,26 +204,36 @@ if (window.chrome && window.chrome.webview) {
         if (msg.target === "output") outputInput.value = msg.path;
         if (msg.target === "work") workInput.value = msg.path;
         break;
-      case "buildStarted":
-        setBusy(true, msg.checkOnly);
+      case "buildStarting":
+        setBusy(true, false);
         startBuildGraph(msg.checkOnly);
-        setStatus(msg.checkOnly ? "Checking package…" : "Building workspace…");
+        setStatus("Loading");
+        break;
+      case "buildStarted":
+        setBusy(true);
+        setStatus("Loading");
         break;
       case "buildStopping":
         stopBtn.disabled = true;
-        setStatus("Stopping…", "warning");
+        fileCount.hidden = true;
+        setStatus("Stopping", "warning");
         break;
       case "log":
         appendLog(msg.line, msg.tag || "");
         break;
       case "buildProgress":
-        if (msg.progress) updateBuildGraph(msg.progress);
+        if (msg.progress) {
+          const { stage, done, total } = msg.progress;
+          if (building && !stopBtn.disabled) {
+            const showCount = stage === "check" && Number.isInteger(done) &&
+              Number.isInteger(total) && done > 0 && done <= total;
+            fileCount.hidden = !showCount;
+            if (showCount) fileCount.textContent = `File ${done}/${total}`;
+          }
+          updateBuildGraph(msg.progress);
+        }
         break;
       case "buildFinished":
-        if (!building && !msg.checkOnly) {
-          startBuildGraph(false);
-          setGraphPhase("");
-        }
         setBusy(false);
         if (msg.returnCode === 0) {
           const status = msg.checkOnly ? "Package check passed" : "Build complete";

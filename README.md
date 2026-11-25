@@ -34,7 +34,7 @@ The build runs on your PC.
 | Shader translation | All **26,503 primary shaders** translated and passed `spirv-val` in a recorded run. Some cross-half wave64 operations remain approximate on 32-wide GPUs. [Shader validation](docs/shader_validation.md#why-spirv-val-is-not-enough) |
 | Windows loader and platform | Stand-in tests cover startup, TLS, file I/O, threads, and shim imports. GDK coverage is partial. [Runtime tests](docs/testing.md) |
 | Xbox D3D12 to Vulkan | Synthetic GPU tests render frames. Retail pipeline and presentation coverage is still in progress. [Graphics roadmap](docs/d3d12_vulkan.md) |
-| Retail boot and gameplay | Boot is unverified. Gameplay is unavailable. The next milestone is the first retail frame. |
+| Retail boot and gameplay | Retail startup reached D3D12 descriptor-heap initialization. The host-backed heap fix passed a synthetic GPU test on an RTX 5070 Laptop GPU. A retail run with that fix and the first rendered frame remain unverified. |
 
 ## How to build
 
@@ -53,7 +53,7 @@ The build runs on your PC.
 
 WaveSpan searches common folders for your package and puts new builds in `Documents\WaveSpan` by default.
 It reuses completed stages on subsequent runs. To resume a build in another folder, choose that folder or pass `--out`.
-Choose a separate work folder if another drive has more free space.
+Choose a separate work folder if another drive has more free space. On Windows, the launcher caps the build worker and its child processes at 80% total CPU, keeps the system awake during the build, and lets the worker run to completion.
 
 ### Prerequisites
 
